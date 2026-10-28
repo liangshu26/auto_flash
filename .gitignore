@@ -1,0 +1,30 @@
+# 下载的刷机包
+flash_prep/
+*.tar.gz
+*.tgz
+*.zip
+
+# 解压目录
+.extracted/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 日志
+*.log
