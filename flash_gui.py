@@ -38,9 +38,21 @@ MODE_TO_TARGET = common.MODE_TO_TARGET
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("XP5 刷机工具")
-        root.geometry("960x760")
-        root.minsize(780, 600)
+        root.title("XP5 刷机工具 v2.0")
+        root.geometry("1024x800")
+        root.minsize(900, 700)
+        
+        # 设置主题样式
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        
+        # 自定义样式
+        self.style.configure('Title.TLabel', font=('Helvetica', 12, 'bold'), foreground='#2c3e50')
+        self.style.configure('Section.TLabel', font=('Helvetica', 10, 'bold'), foreground='#34495e')
+        self.style.configure('Action.TButton', font=('Helvetica', 10), padding=8)
+        self.style.configure('Success.TButton', font=('Helvetica', 10, 'bold'), padding=10)
+        self.style.configure('TLabelFrame', padding=10)
+        self.style.configure('TLabelFrame.Label', font=('Helvetica', 10, 'bold'), foreground='#2c3e50')
 
         self._q = queue.Queue()
         self._busy = False
@@ -56,99 +68,161 @@ class App:
 
     # ------------------------------------------------------------ UI 构建
     def _build_ui(self):
-        pad = {"padx": 8, "pady": 6}
+        # 主容器
+        main_container = ttk.Frame(self.root)
+        main_container.pack(fill="both", expand=True, padx=12, pady=8)
 
         # 顶部: 设备栏
-        top = ttk.LabelFrame(self.root, text="设备 (adb)")
-        top.pack(fill="x", **pad)
+        top = ttk.LabelFrame(main_container, text="  设备状态  ")
+        top.pack(fill="x", pady=(0, 8))
+        
+        top_inner = ttk.Frame(top)
+        top_inner.pack(fill="x", padx=10, pady=8)
+        
         self.dev_var = tk.StringVar(value="正在检测设备...")
-        ttk.Label(top, textvariable=self.dev_var, justify="left",
-                  wraplength=740).pack(side="left", fill="x", expand=True, padx=8, pady=6)
-        self.btn_refresh_dev = ttk.Button(top, text="刷新设备", command=self.refresh_devices)
-        self.btn_refresh_dev.pack(side="right", padx=8, pady=6)
+        dev_label = ttk.Label(top_inner, textvariable=self.dev_var, justify="left",
+                              wraplength=700, font=('Helvetica', 9))
+        dev_label.pack(side="left", fill="x", expand=True)
+        
+        self.btn_refresh_dev = ttk.Button(top_inner, text="刷新设备", 
+                                          command=self.refresh_devices, style='Action.TButton')
+        self.btn_refresh_dev.pack(side="right", padx=(8, 0))
 
         # 中部: 选项卡
-        nb = ttk.Notebook(self.root)
-        nb.pack(fill="both", expand=True, **pad)
+        nb = ttk.Notebook(main_container)
+        nb.pack(fill="both", expand=True, pady=8)
+        
         self.tab_download = ttk.Frame(nb)
         self.tab_flash = ttk.Frame(nb)
         nb.add(self.tab_download, text="  下载刷机包  ")
         nb.add(self.tab_flash, text="  刷机  ")
+        
         self._build_download_tab(self.tab_download)
         self._build_flash_tab(self.tab_flash)
 
-        # 底部: 状态 + 日志
-        logf = ttk.LabelFrame(self.root, text="日志")
-        logf.pack(fill="both", expand=True, **pad)
-        self.log = ScrolledText(logf, height=13, wrap="word", state="disabled",
-                                bg="#111", fg="#ddd", insertbackground="#ddd")
-        self.log.pack(fill="both", expand=True, padx=6, pady=6)
-        for tag, color in (("cmd", "#7fd0ff"), ("ok", "#8ce08c"),
-                           ("err", "#ff8080"), ("dim", "#888")):
+        # 底部: 日志
+        logf = ttk.LabelFrame(main_container, text="  运行日志  ")
+        logf.pack(fill="both", expand=True, pady=(8, 0))
+        
+        self.log = ScrolledText(logf, height=15, wrap="word", state="disabled",
+                                bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
+                                font=('Consolas', 9), relief="flat", borderwidth=0)
+        self.log.pack(fill="both", expand=True, padx=8, pady=8)
+        
+        # 日志颜色标签
+        for tag, color in (("cmd", "#569cd6"), ("ok", "#6a9955"),
+                           ("err", "#f48771"), ("dim", "#808080"),
+                           ("info", "#dcdcaa"), ("warn", "#ce9178")):
             self.log.tag_config(tag, foreground=color)
+        
+        # 状态栏
         bar = ttk.Frame(logf)
-        bar.pack(fill="x", padx=6, pady=(0, 6))
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(bar, textvariable=self.status_var, foreground="#555").pack(side="left")
-        ttk.Button(bar, text="清空日志", command=self._clear_log).pack(side="right")
-        self.btn_cancel = ttk.Button(bar, text="取消", command=self._on_cancel,
-                                     state="disabled")
-        self.btn_cancel.pack(side="right", padx=6)
-        self.btn_pause = ttk.Button(bar, text="暂停", command=self._on_pause,
-                                    state="disabled")
-        self.btn_pause.pack(side="right", padx=6)
+        status_label = ttk.Label(bar, textvariable=self.status_var, 
+                                 font=('Helvetica', 9), foreground="#666")
+        status_label.pack(side="left")
+        
+        # 按钮组
+        btn_frame = ttk.Frame(bar)
+        btn_frame.pack(side="right")
+        
+        self.btn_cancel = ttk.Button(btn_frame, text="取消任务", command=self._on_cancel,
+                                     state="disabled", style='Action.TButton')
+        self.btn_cancel.pack(side="right", padx=(6, 0))
+        
+        self.btn_pause = ttk.Button(btn_frame, text="暂停", command=self._on_pause,
+                                    state="disabled", style='Action.TButton')
+        self.btn_pause.pack(side="right", padx=(6, 0))
+        
+        ttk.Button(btn_frame, text="清空日志", command=self._clear_log,
+                   style='Action.TButton').pack(side="right")
 
     # ---------------- 下载 tab ----------------
     def _build_download_tab(self, parent):
-        pad = {"padx": 8, "pady": 4}
-        row = ttk.Frame(parent)
-        row.pack(fill="x", **pad)
-        ttk.Label(row, text="车型 (如 E29):").pack(side="left")
+        # 创建主容器
+        main_frame = ttk.Frame(parent)
+        main_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        
+        # 绑定鼠标滚轮(如果需要)
+        def _on_mousewheel(event):
+            parent.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        pad = {"padx": 10, "pady": 6}
+        
+        # 车型输入
+        row1 = ttk.Frame(main_frame)
+        row1.pack(fill="x", **pad)
+        ttk.Label(row1, text="车型代码:", style='Section.TLabel').pack(side="left")
         self.platform_var = tk.StringVar()
-        ttk.Entry(row, textvariable=self.platform_var, width=16).pack(side="left", padx=6)
-        ttk.Label(row, text="(必填)", foreground="#888").pack(side="left")
-
-        # 下载目录 (可自由选择; 留空=自动时间戳)
-        drow = ttk.Frame(parent)
-        drow.pack(fill="x", **pad)
-        ttk.Label(drow, text="下载目录:").pack(side="left")
+        platform_entry = ttk.Entry(row1, textvariable=self.platform_var, width=20, 
+                                   font=('Helvetica', 10))
+        platform_entry.pack(side="left", padx=(10, 6))
+        ttk.Label(row1, text="(必填, 如 E29, G01)", foreground="#666", 
+                  font=('Helvetica', 9)).pack(side="left")
+        
+        # 下载目录
+        row2 = ttk.Frame(main_frame)
+        row2.pack(fill="x", **pad)
+        ttk.Label(row2, text="下载目录:", style='Section.TLabel').pack(side="left")
         self.dl_dir_var = tk.StringVar()
-        ttk.Entry(drow, textvariable=self.dl_dir_var, width=46).pack(side="left", padx=6)
-        ttk.Button(drow, text="浏览...", command=self._browse_dl_dir).pack(side="left")
-        ttk.Button(drow, text="自动(时间戳)",
-                   command=lambda: self.dl_dir_var.set("")).pack(side="left", padx=4)
-        ttk.Label(drow, text="留空 = 新建 flash_prep/<时间戳>/",
-                  foreground="#888").pack(side="left", padx=6)
-
-        # DT 号输入 (vlmu/xpu 有大包小包两个框, mcu 只有一个)
+        dir_entry = ttk.Entry(row2, textvariable=self.dl_dir_var, width=50, 
+                              font=('Helvetica', 9))
+        dir_entry.pack(side="left", padx=(10, 6))
+        ttk.Button(row2, text="浏览...", command=self._browse_dl_dir).pack(side="left", padx=(0, 6))
+        ttk.Button(row2, text="自动命名", command=self._auto_name_dl_dir).pack(side="left")
+        ttk.Label(row2, text="(自动生成时间戳目录)", foreground="#666", 
+                  font=('Helvetica', 9)).pack(side="left", padx=6)
+        
+        # DT 号输入区域
+        dt_frame = ttk.LabelFrame(main_frame, text="  DT 号配置  ")
+        dt_frame.pack(fill="x", padx=10, pady=10)
+        
         self.dt_vars = {}
-        for name in ("vlmu", "xpu"):
-            f = ttk.LabelFrame(parent, text=f" {name} ")
-            f.pack(fill="x", **pad)
+        for name, label in [("vlmu", "VLMU"), ("xpu", "XPU")]:
+            f = ttk.LabelFrame(dt_frame, text=f" {label} ")
+            f.pack(fill="x", padx=8, pady=6)
+            
             dt_big = tk.StringVar()
             dt_small = tk.StringVar()
-            ttk.Label(f, text="大包 DT:").grid(row=0, column=0, sticky="e", padx=8, pady=4)
-            ttk.Entry(f, textvariable=dt_big, width=40).grid(row=0, column=1, sticky="w", pady=4)
-            ttk.Label(f, text="(可多个, 空格分隔)", foreground="#888").grid(
-                row=0, column=2, sticky="w", padx=6)
-            ttk.Label(f, text="小包 DT:").grid(row=1, column=0, sticky="e", padx=8, pady=4)
-            ttk.Entry(f, textvariable=dt_small, width=40).grid(row=1, column=1, sticky="w", pady=4)
-            ttk.Label(f, text="(可多个, 空格分隔)", foreground="#888").grid(
-                row=1, column=2, sticky="w", padx=6)
+            
+            row_big = ttk.Frame(f)
+            row_big.pack(fill="x", padx=10, pady=4)
+            ttk.Label(row_big, text="大包 DT:", width=10, anchor="e").pack(side="left")
+            ttk.Entry(row_big, textvariable=dt_big, width=45, 
+                      font=('Consolas', 9)).pack(side="left", padx=(8, 6))
+            ttk.Label(row_big, text="(可多个, 空格分隔)", foreground="#888", 
+                      font=('Helvetica', 8)).pack(side="left")
+            
+            row_small = ttk.Frame(f)
+            row_small.pack(fill="x", padx=10, pady=4)
+            ttk.Label(row_small, text="小包 DT:", width=10, anchor="e").pack(side="left")
+            ttk.Entry(row_small, textvariable=dt_small, width=45, 
+                      font=('Consolas', 9)).pack(side="left", padx=(8, 6))
+            ttk.Label(row_small, text="(可多个, 空格分隔)", foreground="#888", 
+                      font=('Helvetica', 8)).pack(side="left")
+            
             self.dt_vars[name] = {"big": dt_big, "small": dt_small}
-
-        f = ttk.LabelFrame(parent, text=" mcu ")
-        f.pack(fill="x", **pad)
+        
+        # MCU
+        f_mcu = ttk.LabelFrame(dt_frame, text=" MCU ")
+        f_mcu.pack(fill="x", padx=8, pady=6)
         dt_mcu = tk.StringVar()
-        ttk.Label(f, text="MCUDEBUG DT:").grid(row=0, column=0, sticky="e", padx=8, pady=4)
-        ttk.Entry(f, textvariable=dt_mcu, width=40).grid(row=0, column=1, sticky="w", pady=4)
-        ttk.Label(f, text="(可多个, 空格分隔)", foreground="#888").grid(
-            row=0, column=2, sticky="w", padx=6)
+        row_mcu = ttk.Frame(f_mcu)
+        row_mcu.pack(fill="x", padx=10, pady=6)
+        ttk.Label(row_mcu, text="MCUDEBUG:", width=10, anchor="e").pack(side="left")
+        ttk.Entry(row_mcu, textvariable=dt_mcu, width=45, 
+                  font=('Consolas', 9)).pack(side="left", padx=(8, 6))
+        ttk.Label(row_mcu, text="(可多个, 空格分隔)", foreground="#888", 
+                  font=('Helvetica', 8)).pack(side="left")
         self.dt_vars["mcu"] = {"mcu": dt_mcu}
-
-        bar = ttk.Frame(parent)
-        bar.pack(fill="x", padx=8, pady=10)
-        self.btn_download = ttk.Button(bar, text="开始下载", command=self.on_download)
+        
+        # 下载按钮
+        bar = ttk.Frame(main_frame)
+        bar.pack(fill="x", padx=10, pady=12)
+        self.btn_download = ttk.Button(bar, text="开始下载", command=self.on_download, 
+                                       style='Success.TButton')
         self.btn_download.pack(side="left")
 
     def _browse_dl_dir(self):
@@ -156,35 +230,43 @@ class App:
                                     initialdir=(self.dl_dir_var.get() or PREP_ROOT or SCRIPT_DIR))
         if d:
             self.dl_dir_var.set(d)
+    
+    def _auto_name_dl_dir(self):
+        """自动生成带时间戳的下载目录路径"""
+        auto_path = os.path.join(PREP_ROOT, datetime.now().strftime("%Y%m%d_%H%M%S"))
+        self.dl_dir_var.set(auto_path)
 
     # ---------------- 刷机 tab ----------------
     def _build_flash_tab(self, parent):
-        pad = {"padx": 8, "pady": 4}
-        # 目录选择 (可自由浏览任意目录)
-        row = ttk.Frame(parent)
-        row.pack(fill="x", **pad)
-        ttk.Label(row, text="下载目录:").pack(side="left")
+        pad = {"padx": 10, "pady": 6}
+        
+        # 目录选择
+        row1 = ttk.Frame(parent)
+        row1.pack(fill="x", **pad)
+        ttk.Label(row1, text="刷机包目录:", style='Section.TLabel').pack(side="left")
         self.dir_var = tk.StringVar()
-        self.dir_box = ttk.Combobox(row, textvariable=self.dir_var, width=54)  # 可编辑
-        self.dir_box.pack(side="left", padx=6)
+        self.dir_box = ttk.Combobox(row1, textvariable=self.dir_var, width=60, 
+                                    font=('Consolas', 9))
+        self.dir_box.pack(side="left", padx=(10, 6))
         self.dir_box.bind("<<ComboboxSelected>>", lambda e: self._load_dir_packages())
         self.dir_box.bind("<Return>", lambda e: self._load_dir_packages())
-        ttk.Button(row, text="浏览...", command=self._browse_flash_dir).pack(side="left")
-        self.btn_refresh_sess = ttk.Button(row, text="刷新列表",
+        ttk.Button(row1, text="浏览...", command=self._browse_flash_dir).pack(side="left", padx=(0, 6))
+        self.btn_refresh_sess = ttk.Button(row1, text="刷新列表",
                                            command=self._reload_dir_suggestions)
-        self.btn_refresh_sess.pack(side="left", padx=4)
-
-        # 包列表 (勾选要刷的包)
-        pf = ttk.LabelFrame(parent, text="刷机包列表 (勾选要刷的包)")
+        self.btn_refresh_sess.pack(side="left")
+        
+        # 包列表
+        pf = ttk.LabelFrame(parent, text="  刷机包列表  ")
         pf.pack(fill="both", expand=True, **pad)
         
         # 创建可滚动的包列表
         canvas_frame = ttk.Frame(pf)
-        canvas_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        canvas_frame.pack(fill="both", expand=True, padx=10, pady=8)
         
-        self._pkg_canvas = tk.Canvas(canvas_frame, height=200, bg="white")
+        self._pkg_canvas = tk.Canvas(canvas_frame, height=220, bg="#ffffff", 
+                                     highlightthickness=1, highlightbackground="#ddd")
         scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self._pkg_canvas.yview)
-        self._pkg_list_frame = ttk.Frame(self._pkg_canvas)
+        self._pkg_list_frame = ttk.Frame(self._pkg_canvas, style='TFrame')
         
         self._pkg_list_frame.bind(
             "<Configure>",
@@ -197,25 +279,38 @@ class App:
         self._pkg_canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         
-        # xp5 设备选择 (A/B 可多选)
-        r = ttk.Frame(pf)
-        r.pack(fill="x", padx=8, pady=4)
-        ttk.Label(r, text="xp5 设备:").pack(side="left")
+        # 绑定鼠标滚轮
+        def _on_pkg_mousewheel(event):
+            self._pkg_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        self._pkg_canvas.bind_all("<MouseWheel>", _on_pkg_mousewheel)
+        
+        # XP5 设备选择
+        dev_frame = ttk.Frame(pf)
+        dev_frame.pack(fill="x", padx=10, pady=(0, 8))
+        
+        ttk.Label(dev_frame, text="XP5 设备:", style='Section.TLabel').pack(side="left")
         self.xp5_a_var = tk.BooleanVar(value=True)
         self.xp5_b_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(r, text="A", variable=self.xp5_a_var).pack(side="left", padx=4)
-        ttk.Checkbutton(r, text="B", variable=self.xp5_b_var).pack(side="left", padx=4)
+        
+        dev_check_frame = ttk.Frame(dev_frame)
+        dev_check_frame.pack(side="left", padx=(10, 0))
+        
+        ttk.Checkbutton(dev_check_frame, text="A 设备", variable=self.xp5_a_var).pack(side="left", padx=4)
+        ttk.Checkbutton(dev_check_frame, text="B 设备", variable=self.xp5_b_var).pack(side="left", padx=4)
         
         # 刷机按钮
-        cf = ttk.Frame(pf)
-        cf.pack(fill="x", padx=8, pady=4)
-        self.btn_flash_all = ttk.Button(cf, text="刷勾选的包", command=self.on_flash_selected)
-        self.btn_flash_all.pack(side="left", padx=12)
+        btn_frame = ttk.Frame(pf)
+        btn_frame.pack(fill="x", padx=10, pady=(0, 10))
+        
+        self.btn_flash_all = ttk.Button(btn_frame, text="刷选中的包", 
+                                        command=self.on_flash_selected, 
+                                        style='Success.TButton')
+        self.btn_flash_all.pack(side="left", padx=(0, 10))
         
         # 存储包复选框
         self._pkg_checkboxes = {}  # {key: BooleanVar}
         self._pkg_types = {}  # {key: pkg_type}
-        self._pkg_paths = {}  # {key: full_path} (压缩包路径或已解压目录路径)
+        self._pkg_paths = {}  # {key: full_path}
 
     def _browse_flash_dir(self):
         d = filedialog.askdirectory(title="选择刷机包目录",
@@ -251,6 +346,15 @@ class App:
             "vlmu_mcu": "VLMU MCU"
         }
         
+        type_colors = {
+            "vlmu_big": "#3498db",
+            "vlmu_small": "#5dade2",
+            "xp5_big": "#2ecc71",
+            "xp5_small": "#58d68d",
+            "mcu": "#e74c3c",
+            "vlmu_mcu": "#9b59b6"
+        }
+        
         row = 0
         for cat_key in ["vlmu_big", "vlmu_small", "xp5_big", "xp5_small", "mcu", "vlmu_mcu"]:
             pkgs = cats.get(cat_key, [])
@@ -259,37 +363,60 @@ class App:
             if not pkgs and not extracted:
                 continue
             
-            # 类别标题
-            ttk.Label(self._pkg_list_frame, text=f"【{type_labels[cat_key]}】", 
-                     font=("", 9, "bold")).grid(row=row, column=0, sticky="w", padx=4, pady=(8, 2))
+            # 类别标题 (带颜色)
+            cat_label = ttk.Label(self._pkg_list_frame, 
+                                 text=f"▸ {type_labels[cat_key]}", 
+                                 font=('Helvetica', 10, 'bold'),
+                                 foreground=type_colors.get(cat_key, '#2c3e50'))
+            cat_label.grid(row=row, column=0, sticky="w", padx=8, pady=(10, 4))
             row += 1
             
             # 已解压目录 (优先显示)
             for dir_name, full_path in extracted:
                 var = tk.BooleanVar(value=False)
-                cb = ttk.Checkbutton(self._pkg_list_frame, text=f"{dir_name} [已解压]", 
-                                    variable=var)
-                cb.grid(row=row, column=0, sticky="w", padx=20, pady=1)
-                # 用目录名作为 key, 加前缀避免与压缩包冲突
+                cb_frame = ttk.Frame(self._pkg_list_frame)
+                cb_frame.grid(row=row, column=0, sticky="w", padx=24, pady=2)
+                
+                cb = ttk.Checkbutton(cb_frame, variable=var)
+                cb.pack(side="left")
+                
+                name_label = ttk.Label(cb_frame, text=dir_name, 
+                                      font=('Consolas', 9), foreground="#2c3e50")
+                name_label.pack(side="left", padx=(4, 6))
+                
+                tag_label = ttk.Label(cb_frame, text="[已解压]", 
+                                     font=('Helvetica', 8), foreground="#27ae60")
+                tag_label.pack(side="left")
+                
                 key = f"[extracted]{dir_name}"
                 self._pkg_checkboxes[key] = var
                 self._pkg_types[key] = cat_key
-                self._pkg_paths[key] = full_path  # 已解压目录的完整路径
+                self._pkg_paths[key] = full_path
                 row += 1
             
             # 压缩包
             for pkg_name in pkgs:
                 var = tk.BooleanVar(value=False)
-                cb = ttk.Checkbutton(self._pkg_list_frame, text=pkg_name, variable=var)
-                cb.grid(row=row, column=0, sticky="w", padx=20, pady=1)
+                cb_frame = ttk.Frame(self._pkg_list_frame)
+                cb_frame.grid(row=row, column=0, sticky="w", padx=24, pady=2)
+                
+                cb = ttk.Checkbutton(cb_frame, variable=var)
+                cb.pack(side="left")
+                
+                name_label = ttk.Label(cb_frame, text=pkg_name, 
+                                      font=('Consolas', 9), foreground="#34495e")
+                name_label.pack(side="left", padx=4)
+                
                 self._pkg_checkboxes[pkg_name] = var
                 self._pkg_types[pkg_name] = cat_key
                 self._pkg_paths[pkg_name] = os.path.join(dirpath, pkg_name)
                 row += 1
         
         if row == 0:
-            ttk.Label(self._pkg_list_frame, text="(目录中没有找到刷机包)", 
-                     foreground="#888").grid(row=0, column=0, padx=4, pady=4)
+            empty_label = ttk.Label(self._pkg_list_frame, 
+                                   text="(目录中没有找到刷机包)", 
+                                   foreground="#999", font=('Helvetica', 10))
+            empty_label.grid(row=0, column=0, padx=10, pady=20)
 
     # ------------------------------------------------------------ 设备
     def refresh_devices(self):
