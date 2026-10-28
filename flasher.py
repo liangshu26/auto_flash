@@ -675,7 +675,7 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None):
 
 
 def _work_root(pkg):
-    return os.path.join(os.path.dirname(os.path.abspath(pkg)), ".extracted")
+    return os.path.dirname(os.path.abspath(pkg))
 
 
 def run_flash(prep_dir, targets, size_pref="auto", dry_run=False,

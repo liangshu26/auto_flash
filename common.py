@@ -132,10 +132,7 @@ def scan_dir(dirpath):
 def scan_extracted_dir(dirpath):
     """扫描已解压目录, 返回 {类别: [(目录名, 完整路径), ...]}。
     
-    扫描两个位置:
-    1. .extracted 子目录 (常规包解压位置)
-    2. 主目录本身 (VLMU MCU 包解压位置)
-    
+    扫描主目录中的已解压文件夹。
     已解压目录按 mtime 新->旧排序。
     """
     cats = {c: [] for c in CATEGORIES}
@@ -145,22 +142,11 @@ def scan_extracted_dir(dirpath):
     # 收集所有已解压目录
     extracted_dirs = []
     
-    # 1. 扫描 .extracted 子目录
-    extracted_subdir = os.path.join(dirpath, ".extracted")
-    if os.path.isdir(extracted_subdir):
-        try:
-            for d in os.listdir(extracted_subdir):
-                full_path = os.path.join(extracted_subdir, d)
-                if os.path.isdir(full_path):
-                    extracted_dirs.append((d, full_path))
-        except OSError:
-            pass
-    
-    # 2. 扫描主目录 (VLMU MCU 包解压到这里)
+    # 扫描主目录中的子目录
     try:
         for d in os.listdir(dirpath):
             full_path = os.path.join(dirpath, d)
-            if os.path.isdir(full_path) and d != ".extracted":
+            if os.path.isdir(full_path):
                 # 检查是否是有效的解压目录 (包含刷机脚本或文件)
                 if _is_extracted_package(full_path):
                     extracted_dirs.append((d, full_path))
