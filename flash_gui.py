@@ -39,8 +39,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("XP5 刷机工具 v2.0")
-        root.geometry("1024x900")
-        root.minsize(900, 800)
+        root.geometry("900x700")
+        root.minsize(800, 600)
         
         # 设置主题样式
         self.style = ttk.Style()
