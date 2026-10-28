@@ -104,20 +104,9 @@ class App:
         logf = ttk.LabelFrame(main_container, text="  运行日志  ")
         logf.pack(fill="both", expand=True, pady=(8, 0))
         
-        self.log = ScrolledText(logf, height=22, wrap="word", state="disabled",
-                                bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
-                                font=('Consolas', 9), relief="flat", borderwidth=0)
-        self.log.pack(fill="both", expand=True, padx=8, pady=8)
-        
-        # 日志颜色标签
-        for tag, color in (("cmd", "#569cd6"), ("ok", "#6a9955"),
-                           ("err", "#f48771"), ("dim", "#808080"),
-                           ("info", "#dcdcaa"), ("warn", "#ce9178")):
-            self.log.tag_config(tag, foreground=color)
-        
-        # 状态栏
+        # 状态栏 (先打包, 确保在底部有空间)
         bar = ttk.Frame(logf)
-        bar.pack(fill="x", padx=8, pady=(0, 8))
+        bar.pack(fill="x", side="bottom", padx=8, pady=(0, 8))
         
         self.status_var = tk.StringVar(value="就绪")
         status_label = ttk.Label(bar, textvariable=self.status_var, 
@@ -138,6 +127,18 @@ class App:
         
         ttk.Button(btn_frame, text="清空日志", command=self._clear_log,
                    style='Action.TButton').pack(side="right")
+        
+        # 日志文本区域 (后打包, 填充剩余空间)
+        self.log = ScrolledText(logf, height=22, wrap="word", state="disabled",
+                                bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
+                                font=('Consolas', 9), relief="flat", borderwidth=0)
+        self.log.pack(fill="both", expand=True, padx=8, pady=8)
+        
+        # 日志颜色标签
+        for tag, color in (("cmd", "#569cd6"), ("ok", "#6a9955"),
+                           ("err", "#f48771"), ("dim", "#808080"),
+                           ("info", "#dcdcaa"), ("warn", "#ce9178")):
+            self.log.tag_config(tag, foreground=color)
 
     # ---------------- 下载 tab ----------------
     def _build_download_tab(self, parent):
