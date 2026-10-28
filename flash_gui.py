@@ -39,8 +39,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("XP5 刷机工具 v2.0")
-        root.geometry("1024x800")
-        root.minsize(900, 700)
+        root.geometry("1024x900")
+        root.minsize(900, 800)
         
         # 设置主题样式
         self.style = ttk.Style()
@@ -104,7 +104,7 @@ class App:
         logf = ttk.LabelFrame(main_container, text="  运行日志  ")
         logf.pack(fill="both", expand=True, pady=(8, 0))
         
-        self.log = ScrolledText(logf, height=15, wrap="word", state="disabled",
+        self.log = ScrolledText(logf, height=22, wrap="word", state="disabled",
                                 bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
                                 font=('Consolas', 9), relief="flat", borderwidth=0)
         self.log.pack(fill="both", expand=True, padx=8, pady=8)
@@ -151,29 +151,22 @@ class App:
         
         pad = {"padx": 10, "pady": 6}
         
-        # 车型输入
+        # 车型和下载目录在同一行
         row1 = ttk.Frame(main_frame)
         row1.pack(fill="x", **pad)
-        ttk.Label(row1, text="车型代码:", style='Section.TLabel').pack(side="left")
+        ttk.Label(row1, text="车型:", style='Section.TLabel').pack(side="left")
         self.platform_var = tk.StringVar()
-        platform_entry = ttk.Entry(row1, textvariable=self.platform_var, width=20, 
+        platform_entry = ttk.Entry(row1, textvariable=self.platform_var, width=12, 
                                    font=('Helvetica', 10))
-        platform_entry.pack(side="left", padx=(10, 6))
-        ttk.Label(row1, text="(必填, 如 E29, G01)", foreground="#666", 
-                  font=('Helvetica', 9)).pack(side="left")
+        platform_entry.pack(side="left", padx=(6, 20))
         
-        # 下载目录
-        row2 = ttk.Frame(main_frame)
-        row2.pack(fill="x", **pad)
-        ttk.Label(row2, text="下载目录:", style='Section.TLabel').pack(side="left")
+        ttk.Label(row1, text="下载目录:", style='Section.TLabel').pack(side="left")
         self.dl_dir_var = tk.StringVar()
-        dir_entry = ttk.Entry(row2, textvariable=self.dl_dir_var, width=50, 
+        dir_entry = ttk.Entry(row1, textvariable=self.dl_dir_var, width=40, 
                               font=('Helvetica', 9))
-        dir_entry.pack(side="left", padx=(10, 6))
-        ttk.Button(row2, text="浏览...", command=self._browse_dl_dir).pack(side="left", padx=(0, 6))
-        ttk.Button(row2, text="自动命名", command=self._auto_name_dl_dir).pack(side="left")
-        ttk.Label(row2, text="(自动生成时间戳目录)", foreground="#666", 
-                  font=('Helvetica', 9)).pack(side="left", padx=6)
+        dir_entry.pack(side="left", padx=(6, 4))
+        ttk.Button(row1, text="浏览...", command=self._browse_dl_dir).pack(side="left", padx=(0, 4))
+        ttk.Button(row1, text="自动命名", command=self._auto_name_dl_dir).pack(side="left")
         
         # DT 号输入区域
         dt_frame = ttk.LabelFrame(main_frame, text="  DT 号配置  ")
@@ -218,12 +211,42 @@ class App:
                   font=('Helvetica', 8)).pack(side="left")
         self.dt_vars["mcu"] = {"mcu": dt_mcu}
         
+        # 轮询模式设置 (内联到 DT 配置区域)
+        watch_row = ttk.Frame(dt_frame)
+        watch_row.pack(fill="x", padx=8, pady=(8, 6))
+        
+        self.watch_enabled_var = tk.BooleanVar(value=False)
+        watch_cb = ttk.Checkbutton(watch_row, text="启用轮询", variable=self.watch_enabled_var,
+                                   command=self._toggle_watch_options)
+        watch_cb.pack(side="left", padx=(10, 6))
+        
+        ttk.Label(watch_row, text="间隔:", font=('Helvetica', 9)).pack(side="left")
+        self.watch_interval_var = tk.StringVar(value="10")
+        self.watch_interval_entry = ttk.Entry(watch_row, textvariable=self.watch_interval_var, 
+                                              width=6, font=('Consolas', 9), state="disabled")
+        self.watch_interval_entry.pack(side="left", padx=(4, 2))
+        ttk.Label(watch_row, text="分钟", font=('Helvetica', 9)).pack(side="left", padx=(0, 12))
+        
+        ttk.Label(watch_row, text="超时:", font=('Helvetica', 9)).pack(side="left")
+        self.watch_timeout_var = tk.StringVar(value="24")
+        self.watch_timeout_entry = ttk.Entry(watch_row, textvariable=self.watch_timeout_var, 
+                                             width=6, font=('Consolas', 9), state="disabled")
+        self.watch_timeout_entry.pack(side="left", padx=(4, 2))
+        ttk.Label(watch_row, text="小时", font=('Helvetica', 9)).pack(side="left", padx=(0, 12))
+        
+        ttk.Label(watch_row, text="(可用取消按钮停止轮询)", 
+                  foreground="#999", font=('Helvetica', 8)).pack(side="left")
+        
         # 下载按钮
         bar = ttk.Frame(main_frame)
         bar.pack(fill="x", padx=10, pady=12)
         self.btn_download = ttk.Button(bar, text="开始下载", command=self.on_download, 
                                        style='Success.TButton')
-        self.btn_download.pack(side="left")
+        self.btn_download.pack(side="left", padx=(0, 8))
+        
+        self.btn_cancel_watch = ttk.Button(bar, text="取消轮询", command=self._on_cancel_watch,
+                                           state="disabled", style='Action.TButton')
+        self.btn_cancel_watch.pack(side="left")
 
     def _browse_dl_dir(self):
         d = filedialog.askdirectory(title="选择下载目录",
@@ -235,6 +258,15 @@ class App:
         """自动生成带时间戳的下载目录路径"""
         auto_path = os.path.join(PREP_ROOT, datetime.now().strftime("%Y%m%d_%H%M%S"))
         self.dl_dir_var.set(auto_path)
+    
+    def _toggle_watch_options(self):
+        """根据轮询复选框状态启用/禁用输入框"""
+        if self.watch_enabled_var.get():
+            self.watch_interval_entry.configure(state="normal")
+            self.watch_timeout_entry.configure(state="normal")
+        else:
+            self.watch_interval_entry.configure(state="disabled")
+            self.watch_timeout_entry.configure(state="disabled")
 
     # ---------------- 刷机 tab ----------------
     def _build_flash_tab(self, parent):
@@ -266,7 +298,8 @@ class App:
         self._pkg_canvas = tk.Canvas(canvas_frame, height=220, bg="#ffffff", 
                                      highlightthickness=1, highlightbackground="#ddd")
         scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self._pkg_canvas.yview)
-        self._pkg_list_frame = ttk.Frame(self._pkg_canvas, style='TFrame')
+        # 使用 tk.Frame 而不是 ttk.Frame，以便设置白色背景
+        self._pkg_list_frame = tk.Frame(self._pkg_canvas, bg="#ffffff")
         
         self._pkg_list_frame.bind(
             "<Configure>",
@@ -311,6 +344,8 @@ class App:
         self._pkg_checkboxes = {}  # {key: BooleanVar}
         self._pkg_types = {}  # {key: pkg_type}
         self._pkg_paths = {}  # {key: full_path}
+        self._pkg_categories = {}  # {cat_key: [item_frames]} 用于收放
+        self._pkg_cat_expanded = {}  # {cat_key: Boolean} 记录展开状态
 
     def _browse_flash_dir(self):
         d = filedialog.askdirectory(title="选择刷机包目录",
@@ -331,6 +366,8 @@ class App:
         self._pkg_checkboxes.clear()
         self._pkg_types.clear()
         self._pkg_paths.clear()
+        self._pkg_categories.clear()
+        self._pkg_cat_expanded.clear()
         
         # 扫描压缩包和已解压目录
         cats = common.scan_dir(dirpath)
@@ -363,60 +400,115 @@ class App:
             if not pkgs and not extracted:
                 continue
             
-            # 类别标题 (带颜色)
-            cat_label = ttk.Label(self._pkg_list_frame, 
-                                 text=f"▸ {type_labels[cat_key]}", 
+            # 类别标题 (可点击收放)
+            cat_frame = tk.Frame(self._pkg_list_frame, bg="#ffffff")
+            cat_frame.grid(row=row, column=0, sticky="w", padx=8, pady=(10, 4))
+            
+            arrow_var = tk.StringVar(value="▾")  # 默认展开
+            cat_label = tk.Label(cat_frame, 
+                                 textvariable=arrow_var,
                                  font=('Helvetica', 10, 'bold'),
-                                 foreground=type_colors.get(cat_key, '#2c3e50'))
-            cat_label.grid(row=row, column=0, sticky="w", padx=8, pady=(10, 4))
+                                 foreground=type_colors.get(cat_key, '#2c3e50'),
+                                 background="#ffffff",
+                                 cursor="hand2")
+            cat_label.pack(side="left")
+            
+            title_label = tk.Label(cat_frame, 
+                                   text=f" {type_labels[cat_key]} ({len(pkgs) + len(extracted)})", 
+                                   font=('Helvetica', 10, 'bold'),
+                                   foreground=type_colors.get(cat_key, '#2c3e50'),
+                                   background="#ffffff",
+                                   cursor="hand2")
+            title_label.pack(side="left", padx=(2, 0))
+            
+            # 存储当前分类的 item frames
+            item_frames = []
+            self._pkg_categories[cat_key] = item_frames
+            self._pkg_cat_expanded[cat_key] = True  # 默认展开
             row += 1
+            
+            # 绑定点击事件
+            def toggle_cat(event=None, ck=cat_key, av=arrow_var, items=item_frames):
+                self._toggle_category(ck, av, items)
+            cat_label.bind("<Button-1>", toggle_cat)
+            title_label.bind("<Button-1>", toggle_cat)
             
             # 已解压目录 (优先显示)
             for dir_name, full_path in extracted:
                 var = tk.BooleanVar(value=False)
-                cb_frame = ttk.Frame(self._pkg_list_frame)
+                cb_frame = tk.Frame(self._pkg_list_frame, bg="#ffffff")
                 cb_frame.grid(row=row, column=0, sticky="w", padx=24, pady=2)
                 
-                cb = ttk.Checkbutton(cb_frame, variable=var)
+                cb = tk.Checkbutton(cb_frame, variable=var, bg="#ffffff", activebackground="#ffffff",
+                                   command=lambda ck=cat_key, v=var: self._on_pkg_select(ck, v))
                 cb.pack(side="left")
                 
-                name_label = ttk.Label(cb_frame, text=dir_name, 
-                                      font=('Consolas', 9), foreground="#2c3e50")
+                name_label = tk.Label(cb_frame, text=dir_name, 
+                                      font=('Consolas', 9), foreground="#2c3e50", bg="#ffffff")
                 name_label.pack(side="left", padx=(4, 6))
                 
-                tag_label = ttk.Label(cb_frame, text="[已解压]", 
-                                     font=('Helvetica', 8), foreground="#27ae60")
+                tag_label = tk.Label(cb_frame, text="[已解压]", 
+                                     font=('Helvetica', 8), foreground="#27ae60", bg="#ffffff")
                 tag_label.pack(side="left")
                 
                 key = f"[extracted]{dir_name}"
                 self._pkg_checkboxes[key] = var
                 self._pkg_types[key] = cat_key
                 self._pkg_paths[key] = full_path
+                item_frames.append(cb_frame)
                 row += 1
             
             # 压缩包
             for pkg_name in pkgs:
                 var = tk.BooleanVar(value=False)
-                cb_frame = ttk.Frame(self._pkg_list_frame)
+                cb_frame = tk.Frame(self._pkg_list_frame, bg="#ffffff")
                 cb_frame.grid(row=row, column=0, sticky="w", padx=24, pady=2)
                 
-                cb = ttk.Checkbutton(cb_frame, variable=var)
+                cb = tk.Checkbutton(cb_frame, variable=var, bg="#ffffff", activebackground="#ffffff",
+                                   command=lambda ck=cat_key, v=var: self._on_pkg_select(ck, v))
                 cb.pack(side="left")
                 
-                name_label = ttk.Label(cb_frame, text=pkg_name, 
-                                      font=('Consolas', 9), foreground="#34495e")
+                name_label = tk.Label(cb_frame, text=pkg_name, 
+                                      font=('Consolas', 9), foreground="#34495e", bg="#ffffff")
                 name_label.pack(side="left", padx=4)
                 
                 self._pkg_checkboxes[pkg_name] = var
                 self._pkg_types[pkg_name] = cat_key
                 self._pkg_paths[pkg_name] = os.path.join(dirpath, pkg_name)
+                item_frames.append(cb_frame)
                 row += 1
         
         if row == 0:
             empty_label = ttk.Label(self._pkg_list_frame, 
                                    text="(目录中没有找到刷机包)", 
-                                   foreground="#999", font=('Helvetica', 10))
+                                   foreground="#999", font=('Helvetica', 10),
+                                   background="#ffffff")
             empty_label.grid(row=0, column=0, padx=10, pady=20)
+    
+    def _toggle_category(self, cat_key, arrow_var, item_frames):
+        """收放某个分类的包列表。"""
+        expanded = self._pkg_cat_expanded.get(cat_key, True)
+        if expanded:
+            # 收起
+            arrow_var.set("▸")
+            for frame in item_frames:
+                frame.grid_remove()
+            self._pkg_cat_expanded[cat_key] = False
+        else:
+            # 展开
+            arrow_var.set("▾")
+            for frame in item_frames:
+                frame.grid()
+            self._pkg_cat_expanded[cat_key] = True
+    
+    def _on_pkg_select(self, cat_key, selected_var):
+        """每个分类只能选一个包: 选中一个时取消同分类其他包。"""
+        if not selected_var.get():
+            return  # 取消选中时不做处理
+        # 取消同分类其他包的选中状态
+        for key, var in self._pkg_checkboxes.items():
+            if self._pkg_types.get(key) == cat_key and var is not selected_var:
+                var.set(False)
 
     # ------------------------------------------------------------ 设备
     def refresh_devices(self):
@@ -482,42 +574,75 @@ class App:
         return platform, tasks, None
 
     def on_download(self):
-        if self._busy:
-            return
-        platform, tasks, err = self._collect_download_tasks()
-        if err:
-            self._log("err", f"[ERROR] 无法下载: {err}\n")
-            self._modal_ask(messagebox.showwarning, "无法下载", err)
-            return
-        custom = self.dl_dir_var.get().strip()
-        session_dir = custom or os.path.join(PREP_ROOT, datetime.now().strftime("%Y%m%d_%H%M%S"))
-
-        plan = "\n".join(f"  {t}  DT: {dts}" for t, dts in tasks)
-        if not self._modal_ask(
-                messagebox.askyesno,
-                "确认下载", f"车型: {platform}\n\n下载计划:\n{plan}\n\n"
-                            f"目标目录:\n  {session_dir}\n\n开始下载?"):
-            return
-
         try:
-            os.makedirs(session_dir, exist_ok=True)
-        except OSError as e:
-            self._modal_ask(messagebox.showerror, "失败", f"无法创建下载目录: {e}")
-            return
+            self._log("info", "[INFO] 下载按钮已点击\n")
+            if self._busy:
+                self._log("warn", "[WARN] 当前有任务在运行, 请等待结束后再操作\n")
+                return
+            platform, tasks, err = self._collect_download_tasks()
+            if err:
+                self._log("err", f"[ERROR] 无法下载: {err}\n")
+                self._modal_ask(messagebox.showwarning, "无法下载", err)
+                return
+            
+            # 读取轮询设置
+            watch = 0
+            timeout_hrs = 24
+            if self.watch_enabled_var.get():
+                try:
+                    watch = int(self.watch_interval_var.get().strip())
+                    if watch <= 0:
+                        watch = 0
+                except ValueError:
+                    watch = 0
+                try:
+                    timeout_hrs = int(self.watch_timeout_var.get().strip())
+                    if timeout_hrs <= 0:
+                        timeout_hrs = 24
+                except ValueError:
+                    timeout_hrs = 24
+            
+            custom = self.dl_dir_var.get().strip()
+            session_dir = custom or os.path.join(PREP_ROOT, datetime.now().strftime("%Y%m%d_%H%M%S"))
 
-        def job(log, progress_cb):
-            fail = downloader.run_download(
-                platform, tasks, session_dir, log=log,
-                all_=True, cancel_cb=lambda: self._cancelled,
-                pause_cb=lambda: self._paused,
-                progress_cb=progress_cb)
-            return fail == 0
+            plan = "\n".join(f"  {t}  DT: {dts}" for t, dts in tasks)
+            watch_info = ""
+            if watch > 0:
+                watch_info = f"\n\n轮询模式: 每 {watch} 分钟检查一次\n超时时间: {timeout_hrs} 小时"
+            
+            if not self._modal_ask(
+                    messagebox.askyesno,
+                    "确认下载", f"车型: {platform}\n\n下载计划:\n{plan}\n\n"
+                                f"目标目录:\n  {session_dir}{watch_info}\n\n开始下载?"):
+                return
 
-        def after():
-            self._reload_dir_suggestions()
-            self.dir_var.set(session_dir)
+            try:
+                os.makedirs(session_dir, exist_ok=True)
+            except OSError as e:
+                self._modal_ask(messagebox.showerror, "失败", f"无法创建下载目录: {e}")
+                return
 
-        self._run_task(job, f"下载到 {session_dir}", after=after)
+            def job(log, progress_cb):
+                fail = downloader.run_download(
+                    platform, tasks, session_dir, log=log,
+                    all_=True, watch=watch, timeout_hrs=timeout_hrs,
+                    cancel_cb=lambda: self._cancelled,
+                    pause_cb=lambda: self._paused,
+                    progress_cb=progress_cb)
+                return fail == 0
+
+            def after():
+                self._reload_dir_suggestions()
+                self.dir_var.set(session_dir)
+
+            task_desc = f"下载到 {session_dir}"
+            if watch > 0:
+                task_desc += f" (轮询模式: {watch}分钟)"
+            self._run_task(job, task_desc, after=after)
+        except Exception as e:
+            self._log("err", f"[ERROR] 下载按钮异常: {type(e).__name__}: {e}\n")
+            import traceback
+            traceback.print_exc()
 
     # ------------------------------------------------------------ 刷机
     def on_flash_selected(self):
@@ -613,6 +738,14 @@ class App:
             self.btn_pause.configure(text="暂停")
         except tk.TclError:
             pass
+        # 取消轮询按钮: 只在轮询模式下启用
+        try:
+            if busy and self.watch_enabled_var.get():
+                self.btn_cancel_watch.configure(state="normal")
+            else:
+                self.btn_cancel_watch.configure(state="disabled")
+        except tk.TclError:
+            pass
         self._paused = False
         self.status_var.set("运行中..." if busy else "就绪")
         if busy:
@@ -669,7 +802,24 @@ class App:
             return
         self._cancelled = True
         self.status_var.set("正在取消...")
-        self._log("warn", "[WARN] 已请求取消, 等待当前操作结束...\n")
+        # 检查是否在轮询模式
+        if self.watch_enabled_var.get() and self._task_started_at:
+            self._log("warn", "[WARN] 已请求取消轮询, 等待当前操作结束...\n")
+        else:
+            self._log("warn", "[WARN] 已请求取消, 等待当前操作结束...\n")
+    
+    def _on_cancel_watch(self):
+        """专门取消轮询模式。"""
+        if not self._busy:
+            return
+        self._cancelled = True
+        self.status_var.set("正在取消轮询...")
+        self._log("warn", "[WARN] 正在取消轮询...\n")
+        # 禁用取消轮询按钮
+        try:
+            self.btn_cancel_watch.configure(state="disabled")
+        except tk.TclError:
+            pass
 
     def _on_pause(self):
         """暂停/继续: 切换 _paused 标志。"""

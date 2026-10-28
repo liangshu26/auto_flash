@@ -334,7 +334,7 @@ def _select_files_interactive(files, prefix_path, log=default_log):
     return chosen
 
 
-def _watch_poll(dt, platform, prefix, filter_str, interval_min, timeout_hrs, log):
+def _watch_poll(dt, platform, prefix, filter_str, interval_min, timeout_hrs, log, cancel_cb=None):
     """轮询直到 DT 目录出现且匹配到文件; 成功返回 True。"""
     start = time.time()
     timeout_sec = timeout_hrs * 3600
@@ -346,6 +346,11 @@ def _watch_poll(dt, platform, prefix, filter_str, interval_min, timeout_hrs, log
     log(f"[INFO] DT: {dt} | 车型: {platform} | filter: {filter_str}")
     log(f"[INFO] 每 {interval_min} 分钟轮询一次 | 超时 {timeout_hrs}h | Ctrl+C 停止\n")
     while True:
+        # 检查取消
+        if cancel_cb and cancel_cb():
+            log("[WARN] 轮询已取消")
+            return False
+        
         attempt += 1
         elapsed = time.time() - start
         if elapsed >= timeout_sec:
@@ -365,11 +370,14 @@ def _watch_poll(dt, platform, prefix, filter_str, interval_min, timeout_hrs, log
         log(f"[WARN] 暂无匹配文件, {interval_min} 分钟后重试 (剩余 {remaining} 分钟)")
         nxt = datetime.now() + timedelta(minutes=interval_min)
         log(f"[INFO] 下次轮询: {nxt:%Y-%m-%d %H:%M:%S}\n")
-        # 分片 sleep, 避免系统休眠导致长时间卡住
+        # 分片 sleep, 避免系统休眠导致长时间卡住, 同时频繁检查取消
         slept = 0
         while slept < check_sec:
-            time.sleep(min(10, check_sec - slept))
-            slept += 10
+            if cancel_cb and cancel_cb():
+                log("[WARN] 轮询已取消")
+                return False
+            time.sleep(min(2, check_sec - slept))  # 每 2 秒检查一次取消
+            slept += 2
 
 
 def download_dt(dt, platform, prefix, filter_str, dest_dir,
@@ -385,7 +393,7 @@ def download_dt(dt, platform, prefix, filter_str, dest_dir,
     """
     watch_first = False
     if watch > 0:
-        if not _watch_poll(dt, platform, prefix, filter_str, watch, timeout_hrs, log):
+        if not _watch_poll(dt, platform, prefix, filter_str, watch, timeout_hrs, log, cancel_cb):
             return False
         watch_first = True
 
