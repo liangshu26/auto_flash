@@ -42,17 +42,30 @@ class App:
         root.geometry("1024x900")
         root.minsize(900, 800)
         
-        # 设置主题样式
+        # 设置主题样式 - 优先使用原生主题
         self.style = ttk.Style()
-        self.style.theme_use('clam')
+        # macOS 用 aqua, Windows 用 vista, Linux 用 clam
+        if sys.platform == "darwin":
+            try:
+                self.style.theme_use('aqua')
+            except tk.TclError:
+                self.style.theme_use('clam')
+        elif sys.platform == "win32":
+            try:
+                self.style.theme_use('vista')
+            except tk.TclError:
+                self.style.theme_use('clam')
+        else:
+            self.style.theme_use('clam')
         
-        # 自定义样式
-        self.style.configure('Title.TLabel', font=('Helvetica', 12, 'bold'), foreground='#2c3e50')
-        self.style.configure('Section.TLabel', font=('Helvetica', 10, 'bold'), foreground='#34495e')
-        self.style.configure('Action.TButton', font=('Helvetica', 10), padding=8)
-        self.style.configure('Success.TButton', font=('Helvetica', 10, 'bold'), padding=10)
-        self.style.configure('TLabelFrame', padding=10)
+        # 自定义样式 - 现代化配色
+        self.style.configure('Title.TLabel', font=('Helvetica', 13, 'bold'), foreground='#1a1a1a')
+        self.style.configure('Section.TLabel', font=('Helvetica', 10, 'bold'), foreground='#2c3e50')
+        self.style.configure('Action.TButton', font=('Helvetica', 10), padding=(12, 6))
+        self.style.configure('Success.TButton', font=('Helvetica', 10, 'bold'), padding=(16, 8))
+        self.style.configure('TLabelFrame', padding=12)
         self.style.configure('TLabelFrame.Label', font=('Helvetica', 10, 'bold'), foreground='#2c3e50')
+        self.style.configure('TNotebook.Tab', font=('Helvetica', 10), padding=(12, 6))
 
         self._q = queue.Queue()
         self._busy = False
