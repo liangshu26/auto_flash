@@ -86,7 +86,7 @@ def find_serial_by_mode(mode, timeout=15):
 def classify(name):
     """按大小写敏感前缀给包名分类; 不属于任何类别返回 None。
 
-    VLMU*          -> vlmu_big      (adc_flashall.sh 全量刷)
+    VLMU*ENG*      -> vlmu_big      (adc_flashall.sh 全量刷, 必须含 ENG)
     vlmu*          -> vlmu_small    (deploy_xpilot_by_adb.sh 快速部署)
     XCCP*          -> xp5_big
     xpilot*        -> xp5_small
@@ -98,7 +98,8 @@ def classify(name):
         return "mcu"
     if name.startswith("VLMUMCU"):
         return "vlmu_mcu"
-    if name.startswith("VLMU"):
+    # VLMU 大包必须包含 ENG (ENG_ 或 ENG-), 避免把日志文件误识别为大包
+    if name.startswith("VLMU") and "ENG" in name:
         return "vlmu_big"
     if name.startswith("vlmu"):
         return "vlmu_small"
