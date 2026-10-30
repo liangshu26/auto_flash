@@ -790,10 +790,12 @@ class App:
                 ok = bool(job(self._job_log, self._job_progress))
             except Exception as e:  # noqa
                 self._q.put(("log", ("err", f"[异常] {e}\n")))
-            tail = "已取消" if self._cancelled else ("完成" if ok else "失败")
-            tag = "dim" if self._cancelled else ("ok" if ok else "err")
-            self._q.put(("log", (tag, f"\n==== {tail} ====\n")))
-            self._q.put(("finish", (after,)))
+            finally:
+                # 无论成功、失败还是异常, 都要发送 finish 消息恢复按钮状态
+                tail = "已取消" if self._cancelled else ("完成" if ok else "失败")
+                tag = "dim" if self._cancelled else ("ok" if ok else "err")
+                self._q.put(("log", (tag, f"\n==== {tail} ====\n")))
+                self._q.put(("finish", (after,)))
 
         threading.Thread(target=worker, daemon=True).start()
 
