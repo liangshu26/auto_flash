@@ -28,3 +28,6 @@ __pycache__/
 
 # 日志
 *.log
+
+# 刷机工具脚本(从包中提取)
+flash_tools/

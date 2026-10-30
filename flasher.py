@@ -557,15 +557,14 @@ def _run_job(kind, target, pkg, serial, work_root, log, dry_run):
     if not dry_run and not serial:
         log(f"[WARN]   no matching device online for '{target}' — skipped")
         return True
-    eff = serial or "<auto-detect>"
     if kind == "big":
-        return flash_big(target, pkg, eff, work_root, log, dry_run)
+        return flash_big(target, pkg, serial, work_root, log, dry_run)
     if kind == "small":
         return flash_small(target, pkg, work_root, log, dry_run)
     if kind == "mcu":
-        return flash_mcu(pkg, eff, work_root, log, dry_run)
+        return flash_mcu(pkg, serial, work_root, log, dry_run)
     if kind == "vlmu_mcu":
-        return flash_vlmu_mcu(pkg, eff, work_root, log, dry_run)
+        return flash_vlmu_mcu(pkg, serial, work_root, log, dry_run)
     log(f"[ERROR]   unknown job kind: {kind}")
     return False
 
@@ -578,16 +577,15 @@ def _run_job_extracted(kind, target, extracted_dir, serial, work_root, log, dry_
     if not dry_run and not serial:
         log(f"[WARN]   no matching device online for '{target}' — skipped")
         return True
-    eff = serial or "<auto-detect>"
     
     if kind == "big":
-        return flash_big_extracted(target, extracted_dir, eff, log, dry_run)
+        return flash_big_extracted(target, extracted_dir, serial, log, dry_run)
     if kind == "small":
         return flash_small_extracted(target, extracted_dir, log, dry_run)
     if kind == "mcu":
-        return flash_mcu_extracted(extracted_dir, eff, log, dry_run)
+        return flash_mcu_extracted(extracted_dir, serial, log, dry_run)
     if kind == "vlmu_mcu":
-        return flash_vlmu_mcu_extracted(extracted_dir, eff, log, dry_run)
+        return flash_vlmu_mcu_extracted(extracted_dir, serial, log, dry_run)
     log(f"[ERROR]   unknown job kind: {kind}")
     return False
 
