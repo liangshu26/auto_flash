@@ -458,6 +458,13 @@ def _do_flash_vlmu_mcu(extracted_dir, serial, log):
     return _run_vlmu_mcu_upgrade(ota_filename, serial, log)
 
 
+def _adb_offline(line):
+    """判断一行是否是 adb 因设备离线/重启打出的错误噪声。"""
+    s = line.strip()
+    return (s.startswith("error:") or "device not found" in s
+            or "device offline" in s or "no devices/emulators found" in s)
+
+
 def _run_vlmu_mcu_upgrade(ota_filename, serial, log):
     """在 VLMU 设备上执行升级命令。"""
     # Step 1: killall -9 update_service
@@ -519,7 +526,14 @@ source /xpilot/xlauncher/scripts/env.bash
         
         # 监控日志文件
         log("[INFO] Step 4: Monitoring upgrade progress from log file...")
-        
+
+        # conclusion: True=成功, False=失败, None=未判定
+        # 升级成功后会 SwitchReboot, 设备立即重启掉线, 之后任何 adb 查询都只会拿到
+        # "device not found", 因此结果必须在监控阶段锁存, 不能事后重查覆盖。
+        conclusion = None
+        saw_100 = False
+        saw_reboot = False
+
         for i in range(600):  # 最多等待 10 分钟
             time.sleep(1)
             
@@ -535,51 +549,67 @@ source /xpilot/xlauncher/scripts/env.bash
                 progress_output = []
                 common.run_streaming(
                     ["adb", "-s", serial, "shell", "grep 'Current upgrade progress' /xdata/log/latest/update_service.txt.log | tail -1"],
-                    log=lambda x: progress_output.append(x)
+                    log=lambda x: progress_output.append(x) if not _adb_offline(x) else None
                 )
                 
                 if progress_output:
                     progress_line = progress_output[0].strip()
                     log(f"[INFO] {i}s: {progress_line}")
+                    if "100%" in progress_line:
+                        saw_100 = True
                 
                 # 检查是否完成
                 check_output = []
                 common.run_streaming(
                     ["adb", "-s", serial, "shell", "grep -E 'Upgrade progress 100%|FlashExit|SwitchReboot' /xdata/log/latest/update_service.txt.log | tail -3"],
-                    log=lambda x: check_output.append(x)
+                    log=lambda x: check_output.append(x) if not _adb_offline(x) else None
                 )
                 
                 for line in check_output:
                     if "Upgrade progress 100%" in line:
+                        saw_100 = True
                         log(f"[INFO] {i}s: {line.strip()}")
                     if "SwitchReboot" in line and "failed" not in line:
+                        saw_reboot = True
                         log(f"[INFO] {i}s: {line.strip()}")
                 
                 # 检查是否成功完成
                 success_output = []
                 common.run_streaming(
                     ["adb", "-s", serial, "shell", "grep -E 'Upgrade progress 100%.*Success|FlashExit.*Success' /xdata/log/latest/update_service.txt.log | tail -1"],
-                    log=lambda x: success_output.append(x)
+                    log=lambda x: success_output.append(x) if not _adb_offline(x) else None
                 )
                 
                 if success_output:
                     log(f"[OK] Upgrade completed successfully at {i}s")
+                    conclusion = True
                     break
                 
                 # 检查是否失败
                 fail_output = []
                 common.run_streaming(
                     ["adb", "-s", serial, "shell", "grep 'Fail!!!' /xdata/log/latest/update_service.txt.log | tail -1"],
-                    log=lambda x: fail_output.append(x)
+                    log=lambda x: fail_output.append(x) if not _adb_offline(x) else None
                 )
                 
                 if fail_output:
                     log(f"[ERROR] Upgrade failed at {i}s: {fail_output[0].strip()}")
+                    conclusion = False
                     break
                 
+                # 设备已开始重启 -> 升级流程已走完 (成功标志可能来不及抓到)
+                if saw_reboot:
+                    log(f"[OK] {i}s: 设备已进入 SwitchReboot, 升级流程完成")
+                    conclusion = True
+                    break
+
                 # 如果进程退出了且没有明确的成功/失败标志
                 if proc.poll() is not None and i > 30:
-                    log(f"[WARN] Process exited but no clear success/fail flag found")
+                    if saw_100 and proc.returncode == 0:
+                        log(f"[OK] {i}s: 进度已达 100% 且 update_service 退出码为 0")
+                        conclusion = True
+                    else:
+                        log("[WARN] Process exited but no clear success/fail flag found")
                     break
     finally:
         common.untrack_proc(proc)
@@ -589,29 +619,31 @@ source /xpilot/xlauncher/scripts/env.bash
         except:
             pass
     
-    # Step 5: 检查升级是否成功
-    log("[INFO] Step 5: Checking upgrade result...")
-    success_output = []
-    common.run_streaming(
-        ["adb", "-s", serial, "shell", "grep -E 'Upgrade progress 100%|FlashExit|SwitchReboot' /xdata/log/latest/update_service.txt.log | tail -5"],
-        log=lambda x: success_output.append(x)
-    )
-    
-    # 检查是否有成功标志
-    success = False
-    for line in success_output:
-        if "Upgrade progress 100%" in line or ("FlashExit" in line and "failed" not in line):
-            success = True
-            break
-    
-    # Step 6: 显示最终日志
-    log("[INFO] Step 6: Final upgrade log (last 30 lines):")
-    common.run_streaming(
-        ["adb", "-s", serial, "shell", "tail -30 /xdata/log/latest/update_service.txt.log"],
-        log=log
-    )
-    
-    if success:
+    # Step 5/6: 仅在监控阶段没得出结论时才兜底查询。
+    # 若已成功, 设备正在重启, 再查只会拿到 "device not found", 反而误判为失败。
+    if conclusion is None:
+        log("[INFO] Step 5: Checking upgrade result...")
+        success_output = []
+        common.run_streaming(
+            ["adb", "-s", serial, "shell", "grep -E 'Upgrade progress 100%|FlashExit|SwitchReboot' /xdata/log/latest/update_service.txt.log | tail -5"],
+            log=lambda x: success_output.append(x) if not _adb_offline(x) else None
+        )
+
+        for line in success_output:
+            if "Upgrade progress 100%" in line or ("FlashExit" in line and "failed" not in line):
+                conclusion = True
+                break
+        else:
+            conclusion = False
+
+        # Step 6: 显示最终日志
+        log("[INFO] Step 6: Final upgrade log (last 30 lines):")
+        common.run_streaming(
+            ["adb", "-s", serial, "shell", "tail -30 /xdata/log/latest/update_service.txt.log"],
+            log=log
+        )
+
+    if conclusion:
         log("[OK] VLMU MCU upgrade completed successfully.")
         return True
     else:
