@@ -20,14 +20,18 @@ downloader.py — 从 CI 平台按 DT 号下载 ROM 刷机包 (download_rom.sh �
 """
 
 import os
+import re
 import sys
 import json
 import time
 import ssl
+import hashlib
+import threading
 import argparse
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 BASE_URL = "https://cicdops.xiaopeng.link/data/xpilot"
 DEFAULT_WATCH_INTERVAL = 10   # 分钟
@@ -151,14 +155,13 @@ def find_files(path, filter_str="", log=default_log):
     return results
 
 
-def download_file(key, dest_dir, log=default_log, timeout=120, cancel_cb=None, pause_cb=None, progress_cb=None):
+def _download_once(key, dest_dir, log=default_log, timeout=120, cancel_cb=None, pause_cb=None, progress_cb=None):
     """下载单个文件到 dest_dir, 支持断点续传 (Range)。成功返回 True。
 
     cancel_cb: 可选, 无参函数, 返回 True 表示应取消下载。
     pause_cb: 可选, 无参函数, 返回 True 表示应暂停下载。
     progress_cb: 可选, 函数签名 (written, total, speed, eta_str), 用于实时更新进度。
     """
-    import time
     filename = os.path.basename(key)
     dest = os.path.join(dest_dir, filename)
     url = f"{BASE_URL}/{key}"
@@ -218,6 +221,7 @@ def download_file(key, dest_dir, log=default_log, timeout=120, cancel_cb=None, p
         written = existing
         start_time = time.time()
         last_log_pct = -1
+        last_emit = 0.0
         try:
             with open(dest, mode) as fh:
                 while True:
@@ -240,18 +244,18 @@ def download_file(key, dest_dir, log=default_log, timeout=120, cancel_cb=None, p
                     fh.write(chunk)
                     written += len(chunk)
                     
-                    # 实时回调更新进度
+                    # 实时回调更新进度 (节流: 每 0.25s 一次, 避免高频塞爆 GUI 队列)
                     if progress_cb:
                         now = time.time()
-                        elapsed = now - start_time
-                        speed = (written - existing) / elapsed if elapsed > 0 else 0
-                        eta_str = ""
-                        if total and speed > 0:
-                            eta_sec = (total - written) / speed
-                            eta_min = int(eta_sec // 60)
-                            eta_sec = int(eta_sec % 60)
-                            eta_str = f"{eta_min:02d}:{eta_sec:02d}"
-                        progress_cb(written, total, speed, eta_str)
+                        if now - last_emit >= 0.25:
+                            last_emit = now
+                            elapsed = now - start_time
+                            speed = (written - existing) / elapsed if elapsed > 0 else 0
+                            eta_str = ""
+                            if total and speed > 0:
+                                eta_sec = (total - written) / speed
+                                eta_str = f"{int(eta_sec // 60):02d}:{int(eta_sec % 60):02d}"
+                            progress_cb(written, total, speed, eta_str)
                     
                     # 每 10% 打印一次日志
                     if total:
@@ -278,9 +282,115 @@ def download_file(key, dest_dir, log=default_log, timeout=120, cancel_cb=None, p
         log(f"[ERROR] 文件大小不匹配: 期望 {format_size(server_size)}, 实际 {format_size(final_size)}")
         log(f"[ERROR] 文件可能损坏, 请删除后重新下载: {dest}")
         return False
-    
+
+    if progress_cb:
+        progress_cb(written, total or written, 0, "")
     log(f"[OK] 已下载: {filename} ({format_size(written)})")
     return True
+
+
+# ---------------------------------------------------------------- MD5 校验
+_MD5_RE = re.compile(r"[0-9a-fA-F]{32}")
+
+
+def _file_md5(path, chunk=1 << 20):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(chunk), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def check_md5(key, path, log=default_log, timeout=30):
+    """下载后与服务器上的 <key>.md5 校验。服务器无 .md5 或格式不识别时跳过 (返回 True)。"""
+    url = f"{BASE_URL}/{key}.md5"
+    req = urllib.request.Request(url, headers={"User-Agent": "xp5-downloader/1.0"})
+    try:
+        with _urlopen(req, timeout) as r:
+            content = r.read().decode("utf-8", "replace")
+    except Exception:  # noqa
+        log(f"[WARN] 服务器无 .md5, 跳过校验: {os.path.basename(path)}")
+        return True
+    m = _MD5_RE.search(content)
+    if not m:
+        log(f"[WARN] .md5 内容无法解析, 跳过校验: {os.path.basename(path)}")
+        return True
+    expect = m.group(0).lower()
+    log(f"[INFO] 校验 MD5: {os.path.basename(path)} ...")
+    try:
+        actual = _file_md5(path)
+    except OSError as e:
+        log(f"[ERROR] 读取文件失败: {e}")
+        return False
+    if actual != expect:
+        log(f"[ERROR] MD5 不匹配: 期望 {expect}, 实际 {actual}")
+        return False
+    log(f"[OK] MD5 校验通过: {os.path.basename(path)}")
+    return True
+
+
+def download_file(key, dest_dir, log=default_log, timeout=120, cancel_cb=None,
+                  pause_cb=None, progress_cb=None, retries=3, verify=True):
+    """下载单个文件 (含失败自动重试 + MD5 校验)。成功返回 True。
+
+    网络类失败自动重试 (断点续传, 不从头下); MD5 不匹配则删除文件重下。
+    """
+    filename = os.path.basename(key)
+    for attempt in range(1, retries + 1):
+        if cancel_cb and cancel_cb():
+            return False
+        ok = _download_once(key, dest_dir, log=log, timeout=timeout,
+                            cancel_cb=cancel_cb, pause_cb=pause_cb,
+                            progress_cb=progress_cb)
+        if cancel_cb and cancel_cb():
+            return False
+        if ok:
+            if not verify:
+                return True
+            if check_md5(key, os.path.join(dest_dir, filename), log):
+                return True
+            log(f"[ERROR] MD5 校验失败, 删除文件后重下: {filename}")
+            try:
+                os.remove(os.path.join(dest_dir, filename))
+            except OSError:
+                pass
+            ok = False
+        if attempt < retries:
+            log(f"[WARN] {filename} 第 {attempt}/{retries} 次尝试失败, 3 秒后重试")
+            time.sleep(3)
+    log(f"[ERROR] 下载失败 (已重试 {retries} 次): {filename}")
+    return False
+
+
+class _ProgressAgg:
+    """并发下载时聚合多个文件的进度, 统一回调 GUI。"""
+
+    def __init__(self, cb):
+        self._cb = cb
+        self._lock = threading.Lock()
+        self._st = {}            # key -> (written, total)
+        self._last_t = time.time()
+        self._last_w = 0
+        self._speed = 0.0
+
+    def update(self, key, written, total):
+        with self._lock:
+            self._st[key] = (written, total or 0)
+            w = sum(a for a, _ in self._st.values())
+            t = sum(b for _, b in self._st.values())
+            now = time.time()
+            dt = now - self._last_t
+            if dt < 0.25:
+                return
+            inst = (w - self._last_w) / dt if dt > 0 else 0
+            self._speed = self._speed * 0.6 + inst * 0.4 if self._speed else inst
+            self._last_t = now
+            self._last_w = w
+            eta = ""
+            if t and self._speed > 0:
+                sec = max(0, (t - w) / self._speed)
+                eta = f"{int(sec // 60):02d}:{int(sec % 60):02d}"
+            self._cb(w, t, self._speed, eta)
 
 
 # ---------------------------------------------------------------- 高层流程
@@ -425,14 +535,28 @@ def download_dt(dt, platform, prefix, filter_str, dest_dir,
         return True
 
     log(f"[INFO] 将下载 {len(selected)} 个文件到: {dest_dir}\n")
-    ok = True
-    for key in selected:
+    if len(selected) == 1:
+        key = selected[0]
         if cancel_cb and cancel_cb():
             log("[WARN] 下载已取消")
             return False
-        if not download_file(key, dest_dir, log=log, cancel_cb=cancel_cb,
-                             pause_cb=pause_cb, progress_cb=progress_cb):
-            ok = False
+        return download_file(key, dest_dir, log=log, cancel_cb=cancel_cb,
+                             pause_cb=pause_cb, progress_cb=progress_cb)
+
+    # 多文件: 最多 3 个并发 (跨文件并发不拖慢单文件, 总耗时更短)
+    agg = _ProgressAgg(progress_cb) if progress_cb else None
+
+    def one(k):
+        if cancel_cb and cancel_cb():
+            return False
+        cb = (lambda w, t, s, e, kk=k: agg.update(kk, w, t)) if agg else None
+        return download_file(k, dest_dir, log=log, cancel_cb=cancel_cb,
+                             pause_cb=pause_cb, progress_cb=cb)
+
+    ok = True
+    with ThreadPoolExecutor(max_workers=min(3, len(selected))) as ex:
+        for res in ex.map(one, selected):
+            ok = ok and res
     return ok
 
 

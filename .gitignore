@@ -31,3 +31,6 @@ __pycache__/
 
 # 刷机工具脚本(从包中提取)
 flash_tools/
+
+# GUI 会话日志
+logs/

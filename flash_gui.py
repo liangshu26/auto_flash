@@ -61,10 +61,33 @@ class App:
         self._cancelled = False
         self._paused = False
         self._task_started_at = None
+        self._cancellable = True
+        self._watchdog_min = 0
+        self._last_dev_err = ""
+
+        # GUI 模式: 子进程自成进程组, 关窗时可整树杀掉
+        common.set_gui_mode(True)
+
+        # 会话日志落盘 (logs/gui_<时间戳>.log), 界面上只显示最近 3000 行, 文件保留全量
+        self._log_fh = None
+        self._log_path = ""
+        try:
+            log_dir = os.path.join(SCRIPT_DIR, "logs")
+            os.makedirs(log_dir, exist_ok=True)
+            self._log_path = os.path.join(
+                log_dir, f"gui_{datetime.now():%Y%m%d_%H%M%S}.log")
+            self._log_fh = open(self._log_path, "a", encoding="utf-8", buffering=1)
+        except OSError:
+            pass
+
         self._build_ui()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll()
         self.refresh_devices()
         self._reload_dir_suggestions(select_first=True)
+        if self._log_path:
+            self._log("dim", f"[INFO] 会话日志: {self._log_path}\n")
+        self.root.after(15000, self._auto_refresh_tick)
 
     # ------------------------------------------------------------ UI 构建
     def _build_ui(self):
@@ -125,6 +148,9 @@ class App:
                                     state="disabled", style='Action.TButton')
         self.btn_pause.pack(side="right", padx=(6, 0))
         
+        ttk.Button(btn_frame, text="导出日志", command=self._export_log,
+                   style='Action.TButton').pack(side="right", padx=(6, 0))
+
         ttk.Button(btn_frame, text="清空日志", command=self._clear_log,
                    style='Action.TButton').pack(side="right")
         
@@ -145,10 +171,6 @@ class App:
         # 创建主容器
         main_frame = ttk.Frame(parent)
         main_frame.pack(fill="both", expand=True, padx=8, pady=8)
-        
-        # 绑定鼠标滚轮(如果需要)
-        def _on_mousewheel(event):
-            parent.yview_scroll(int(-1*(event.delta/120)), "units")
         
         pad = {"padx": 10, "pady": 6}
         
@@ -313,10 +335,31 @@ class App:
         self._pkg_canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         
-        # 绑定鼠标滚轮
-        def _on_pkg_mousewheel(event):
-            self._pkg_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
-        self._pkg_canvas.bind_all("<MouseWheel>", _on_pkg_mousewheel)
+        # 鼠标滚轮: 只在指针进入包列表时绑定, 且按平台处理 delta
+        # (macOS 的 event.delta 是小数值, 不能按 Windows 的 /120 算; Linux 走 Button-4/5)
+        def _pkg_wheel(event):
+            d = event.delta
+            if sys.platform != "darwin":
+                d = d // 120 if abs(d) >= 120 else (1 if d > 0 else -1 if d < 0 else 0)
+            d = max(-5, min(5, d))
+            if d:
+                self._pkg_canvas.yview_scroll(-d, "units")
+
+        def _pkg_wheel_btn(event):
+            self._pkg_canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+
+        def _wheel_enter(_e):
+            self._pkg_canvas.bind_all("<MouseWheel>", _pkg_wheel)
+            self._pkg_canvas.bind_all("<Button-4>", _pkg_wheel_btn)
+            self._pkg_canvas.bind_all("<Button-5>", _pkg_wheel_btn)
+
+        def _wheel_leave(_e):
+            self._pkg_canvas.unbind_all("<MouseWheel>")
+            self._pkg_canvas.unbind_all("<Button-4>")
+            self._pkg_canvas.unbind_all("<Button-5>")
+
+        self._pkg_canvas.bind("<Enter>", _wheel_enter)
+        self._pkg_canvas.bind("<Leave>", _wheel_leave)
         
         # XP5 设备选择
         dev_frame = ttk.Frame(pf)
@@ -530,8 +573,25 @@ class App:
         if not devs:
             self.dev_var.set('未检测到在线设备 (接好 adb 线后点"刷新设备")')
             return
-        self.dev_var.set("\n".join(
-            f"{s}  [{m}] -> {MODE_TO_TARGET.get(m, '-')}" for s, m in devs))
+        lines = []
+        has_unknown = False
+        for d in devs:
+            s, m = d[0], d[1]
+            src = d[2] if len(d) > 2 else "adb"
+            if m == "unknown":
+                has_unknown = True
+                note = "fastboot 设备, board-type 未知" if src == "fastboot" else "识别失败, 会自动重试"
+                lines.append(f"{s}  [{note}] -> -")
+            else:
+                mode_txt = f"{m} | fastboot" if src == "fastboot" else m
+                lines.append(f"{s}  [{mode_txt}] -> {MODE_TO_TARGET.get(m, '-')}")
+        self.dev_var.set("\n".join(lines))
+        # 识别失败时把原因写进日志 (设备刚启动/adb 版本冲突/system 未就绪等)
+        # 同一原因只记一次, 避免 15s 自动刷新反复刷屏
+        err = common.last_chipmode_error if has_unknown else ""
+        if err and err != self._last_dev_err:
+            self._log("warn", f"[WARN] ChipMode 识别失败: {err}\n")
+        self._last_dev_err = err
 
     # ------------------------------------------------------------ 目录 / 包
     def _reload_dir_suggestions(self, select_first=False):
@@ -639,7 +699,9 @@ class App:
             task_desc = f"下载到 {session_dir}"
             if watch > 0:
                 task_desc += f" (轮询模式: {watch}分钟)"
-            self._run_task(job, task_desc, after=after)
+            # 看门狗: 轮询模式按用户设置的超时放宽, 普通下载 4 小时兜底
+            watchdog = (timeout_hrs * 60 + 60) if watch > 0 else 240
+            self._run_task(job, task_desc, after=after, watchdog_min=watchdog)
         except Exception as e:
             self._log("err", f"[ERROR] 下载按钮异常: {type(e).__name__}: {e}\n")
             import traceback
@@ -711,6 +773,19 @@ class App:
                 self._log("err", f"[ERROR] 未知包类型: {pkg_type}\n")
                 continue
         
+        # macOS: 大包依赖包内 Linux 版 fastboot, 禁止; 小包/MCU 走系统 adb, 可正常刷
+        if sys.platform == "darwin":
+            big_names = [os.path.basename(j[2]) for j in jobs if j[0] == "big"]
+            if big_names:
+                names = "\n  ".join(sorted(set(big_names)))
+                self._log("err", f"[ERROR] macOS 不支持大包刷机 (依赖 Linux fastboot): {names}\n")
+                self._modal_ask(
+                    messagebox.showerror,
+                    "平台限制",
+                    f"macOS 仅支持刷小包和 MCU。\n\n大包刷机依赖包内 Linux 版 fastboot,\n"
+                    f"请在 Linux 电脑上执行:\n  {names}")
+                return
+
         if not self._modal_ask(
                 messagebox.askyesno,
                 "确认刷写",
@@ -718,10 +793,28 @@ class App:
                 "\n\n确认继续?"):
             return
         
+        results = []
+
+        def job(log, prog):
+            return flasher.execute_jobs(jobs, log=log, results_out=results)
+
+        def after():
+            # 刷机会产生解压目录, 结束后刷新包列表
+            self._load_dir_packages()
+            if results:
+                status_txt = {"ok": "[成功]", "failed": "[失败]",
+                              "skipped": "[跳过: 无设备]"}
+                lines = "\n".join(
+                    f"{status_txt.get(r['status'], r['status'])}  {r['name']} -> {r['target']}"
+                    for r in results)
+                all_ok = all(r["status"] == "ok" for r in results)
+                self._modal_ask(
+                    messagebox.showinfo if all_ok else messagebox.showwarning,
+                    "刷机结果", lines)
+
         header = f"刷勾选的包 ({len(jobs)} 个任务)"
-        self._run_task(
-            lambda log, prog: flasher.execute_jobs(jobs, log=log),
-            header)
+        self._log("warn", "[WARN] 刷机过程不可中途取消, 请勿断开设备或退出程序\n")
+        self._run_task(job, header, after=after, cancellable=False, watchdog_min=0)
 
     # ------------------------------------------------------------ 命令执行
     def _set_busy(self, busy):
@@ -734,21 +827,26 @@ class App:
             except tk.TclError:
                 pass
         try:
-            self.btn_cancel.configure(state=("normal" if busy else "disabled"))
-            self.btn_pause.configure(state=("normal" if busy else "disabled"))
+            # 取消/暂停只对可取消任务 (下载) 开放; 刷机中途不可取消
+            cancellable = busy and self._cancellable
+            self.btn_cancel.configure(state=("normal" if cancellable else "disabled"))
+            self.btn_pause.configure(state=("normal" if cancellable else "disabled"))
             self.btn_pause.configure(text="暂停")
         except tk.TclError:
             pass
         # 取消轮询按钮: 只在轮询模式下启用
         try:
-            if busy and self.watch_enabled_var.get():
+            if busy and self._cancellable and self.watch_enabled_var.get():
                 self.btn_cancel_watch.configure(state="normal")
             else:
                 self.btn_cancel_watch.configure(state="disabled")
         except tk.TclError:
             pass
         self._paused = False
-        self.status_var.set("运行中..." if busy else "就绪")
+        if busy:
+            self.status_var.set("运行中..." if self._cancellable else "刷机中 (不可取消)...")
+        else:
+            self.status_var.set("就绪")
         if busy:
             self._task_started_at = time.monotonic()
         else:
@@ -774,12 +872,17 @@ class App:
                     pass
             self.root.after(100, _restore)
 
-    def _run_task(self, job, header, after=None):
+    def _run_task(self, job, header, after=None, cancellable=True, watchdog_min=240):
         """在子线程跑一个 job(log, progress_cb)->bool; 下载/刷机都走这里。
 
         job 内部 (downloader / flasher) 把日志逐行喂给 log 回调, 进度喂给
         progress_cb; 两者都只入队, 由主线程 _poll 落地, 保证 UI 不被阻塞。
+
+        cancellable: 任务是否支持取消 (刷机不可取消, 按钮会保持禁用)。
+        watchdog_min: 看门狗超时 (分钟), 0 表示禁用 (刷机任务禁用, 大包常超 30 分钟)。
         """
+        self._cancellable = cancellable
+        self._watchdog_min = watchdog_min
         self._set_busy(True)
         self._cancelled = False
         self._log("cmd", f"\n==== {header} ====\n")
@@ -871,6 +974,52 @@ class App:
         self.log.delete("1.0", "end")
         self.log.configure(state="disabled")
 
+    def _export_log(self):
+        """把当前界面日志另存为文件 (会话全量日志在 logs/ 下自动落盘)。"""
+        path = filedialog.asksaveasfilename(
+            title="导出日志", defaultextension=".log",
+            initialfile=f"flash_gui_{datetime.now():%Y%m%d_%H%M%S}.log",
+            initialdir=SCRIPT_DIR,
+            filetypes=[("日志文件", "*.log"), ("所有文件", "*.*")])
+        if not path:
+            return
+        try:
+            content = self.log.get("1.0", "end-1c")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+            self._log("ok", f"[OK] 日志已导出: {path}\n")
+        except OSError as e:
+            self._modal_ask(messagebox.showerror, "导出失败", str(e))
+
+    def _auto_refresh_tick(self):
+        """空闲时每 15s 自动刷新设备列表 (任务运行中跳过, 避免干扰刷机)。"""
+        try:
+            if not self._busy and not self._dev_busy:
+                self.refresh_devices()
+        except Exception:  # noqa
+            pass
+        finally:
+            self.root.after(15000, self._auto_refresh_tick)
+
+    def _on_close(self):
+        """关窗: 有任务在跑时先确认; 强退时杀掉全部子进程, 避免孤儿 adb/fastboot。"""
+        if self._busy:
+            msg = "当前有任务正在运行。\n"
+            if not self._cancellable:
+                msg += "\n刷机正在进行! 强制退出会中断刷机, 可能导致设备损坏!\n"
+            msg += "\n确定要退出吗?"
+            if not self._modal_ask(messagebox.askyesno, "任务进行中", msg):
+                return
+            self._cancelled = True
+            common.kill_active_procs()
+        if self._log_fh:
+            try:
+                self._log_fh.close()
+            except (OSError, ValueError):
+                pass
+            self._log_fh = None
+        self.root.destroy()
+
     MAXLINES = 3000
 
     def _poll(self):
@@ -915,7 +1064,13 @@ class App:
                     merged.append((tag, [text]))
             self.log.configure(state="normal")
             for tag, chunks in merged:
-                self.log.insert("end", "".join(chunks), tag if tag else ())
+                text = "".join(chunks)
+                self.log.insert("end", text, tag if tag else ())
+                if self._log_fh:
+                    try:
+                        self._log_fh.write(text)
+                    except (OSError, ValueError):
+                        pass
             # 限制总行数, 防止 Text 无限增长导致重绘越来越慢
             linecount = int(self.log.index("end-1c").split(".")[0])
             if linecount > self.MAXLINES:
@@ -950,12 +1105,13 @@ class App:
                 except Exception as e:  # noqa
                     self._q.put(("log", ("err", f"[收尾异常] {type(e).__name__}: {e}\n")))
 
-        # 看门狗: 任务跑太久自动取消, 防止子进程挂死把 UI 锁死
-        if self._busy and self._task_started_at:
+        # 看门狗: 只对可取消任务 (下载/轮询) 生效, 防止子进程挂死把 UI 锁死。
+        # 刷机任务禁用 (大包刷写经常超过 30 分钟, 且中途不可取消)。
+        if self._busy and self._task_started_at and self._watchdog_min > 0:
             elapsed = time.monotonic() - self._task_started_at
-            if elapsed > 30 * 60:  # 30 分钟
+            if elapsed > self._watchdog_min * 60:
                 self._cancelled = True
-                self._log("warn", "[WARN] 任务运行超过 30 分钟, 已请求取消\n")
+                self._log("warn", f"[WARN] 任务运行超过 {self._watchdog_min} 分钟, 已请求取消\n")
                 self.status_var.set("超时, 正在取消...")
 
 

@@ -103,15 +103,19 @@ def _copy_image(serial, appa, appb, log):
 
 
 def _check_zone(serial, slave_opt, log):
-    """读 aurix_utility -v, 判断当前运行区 (A=1 / B=2)。失败返回 0。"""
+    """读 aurix_utility -v, 判断当前运行区 (A=1 / B=2)。失败或解析不到返回 0。"""
     out = _adb_shell(serial, f"{AURIX_UTIL} -v{slave_opt}")
     if not out.strip():
         log(f"[ERROR] 无法从设备 {serial} 读取 aurix 区信息")
         return ZONE_UNKNOWN
     for line in out.splitlines():
-        if "Aurix active boot" in line and ":A" in line:
-            return ZONE_A
-    return ZONE_B
+        if "Aurix active boot" in line:
+            if ":A" in line:
+                return ZONE_A
+            if ":B" in line:
+                return ZONE_B
+    log(f"[ERROR] 无法从设备输出解析当前 Aurix 运行区")
+    return ZONE_UNKNOWN
 
 
 def _flash_zone(serial, hexpath, slave_opt, log, running, flashing):

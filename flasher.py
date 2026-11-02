@@ -21,6 +21,8 @@ flasher.py — 一键刷机 (flash.sh 的 Python 版)
 
 import os
 import sys
+import time
+import shutil
 import tarfile
 import zipfile
 import argparse
@@ -65,11 +67,73 @@ def _unzip_keep_perms(zip_path, dest):
                     pass
 
 
+_EXTRACT_MARKER = ".extract_done"
+
+
+def _marker_valid(dest, pkg):
+    """标记文件记录包大小+mtime; 包被替换后标记自动失效。"""
+    try:
+        with open(os.path.join(dest, _EXTRACT_MARKER), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        return (len(lines) >= 2
+                and lines[0] == str(os.path.getsize(pkg))
+                and lines[1] == str(int(os.path.getmtime(pkg))))
+    except (OSError, ValueError):
+        return False
+
+
+def _write_marker(dest, pkg):
+    try:
+        with open(os.path.join(dest, _EXTRACT_MARKER), "w", encoding="utf-8") as f:
+            f.write(f"{os.path.getsize(pkg)}\n{int(os.path.getmtime(pkg))}\n"
+                    f"{os.path.basename(pkg)}\n{time.ctime()}\n")
+    except OSError:
+        pass
+
+
+def _safe_tar_members(tf, dest, log):
+    """Py<3.12 无 filter 参数: 手动拒绝绝对路径 / .. 成员, 防路径穿越。"""
+    dest_real = os.path.realpath(dest)
+    good = []
+    for m in tf.getmembers():
+        target = os.path.realpath(os.path.join(dest_real, m.name))
+        if target != dest_real and not target.startswith(dest_real + os.sep):
+            log(f"[WARN] 跳过可疑成员 (路径穿越): {m.name}")
+            continue
+        good.append(m)
+    return good
+
+
+def _check_tmp_space(log, need_gb=6):
+    """fastboot 会在 /tmp 暂存大镜像 (xpilot.img 约 5GB), 刷大包前提前检查。"""
+    try:
+        free = shutil.disk_usage("/tmp").free
+    except OSError:
+        return True
+    if free < need_gb * (1 << 30):
+        log(f"[ERROR] /tmp 可用空间不足: 需要 {need_gb}GB, 当前 {free >> 30}GB")
+        log("[ERROR] fastboot 需要在 /tmp 暂存大镜像, 请清理后重试")
+        return False
+    return True
+
+
 def extract_pkg(pkg, dest, log):
-    if os.path.isdir(dest) and os.listdir(dest):
+    if _marker_valid(dest, pkg):
         log(f"[INFO] already extracted, reuse: {dest}")
         return True
-    
+    if os.path.isdir(dest) and os.listdir(dest):
+        log(f"[WARN] 目录非空但无有效完成标记 (可能上次解压不完整), 重新解压: {dest}")
+
+    # 磁盘空间预检: 镜像压缩率低, 按包大小 1.3 倍预留
+    try:
+        need = int(os.path.getsize(pkg) * 1.3)
+        free = shutil.disk_usage(os.path.dirname(os.path.abspath(dest))).free
+        if free < need:
+            log(f"[ERROR] 磁盘空间不足: 解压约需 {need >> 30}GB, 可用 {free >> 30}GB ({dest})")
+            return False
+    except OSError as e:
+        log(f"[WARN] 无法检查磁盘空间: {e}")
+
     # 先验证压缩包完整性
     if pkg.endswith((".tar.gz", ".tgz")):
         log(f"[INFO] 验证压缩包完整性: {os.path.basename(pkg)}")
@@ -98,7 +162,7 @@ def extract_pkg(pkg, dest, log):
         except Exception as e:
             log(f"[WARN] 验证压缩包时出错: {e}")
             # 继续尝试解压, 让后续步骤报错
-    
+
     os.makedirs(dest, exist_ok=True)
     log(f"[OK] ==> Extracting {os.path.basename(pkg)}")
     try:
@@ -107,7 +171,8 @@ def extract_pkg(pkg, dest, log):
                 try:
                     tf.extractall(dest, filter="tar")   # Py3.12+: 允许符号链接
                 except TypeError:
-                    tf.extractall(dest)                 # Py<3.12: 无 filter 参数
+                    # Py<3.12: 无 filter 参数, 手动过滤危险成员
+                    tf.extractall(dest, members=_safe_tar_members(tf, dest, log))
         elif pkg.endswith(".zip"):
             _unzip_keep_perms(pkg, dest)
         else:
@@ -120,6 +185,7 @@ def extract_pkg(pkg, dest, log):
     except Exception as e:  # noqa
         log(f"[ERROR] 解压失败 {os.path.basename(pkg)}: {e}")
         return False
+    _write_marker(dest, pkg)
     return True
 
 
@@ -144,6 +210,18 @@ def _find_file_with_prefix(root, prefix, path_contains=None):
     return None
 
 
+def _find_files_with_prefix(root, prefix, path_contains=None):
+    """查找所有文件名以 prefix 开头的文件, 返回完整路径列表。"""
+    results = []
+    for dirpath, _, files in os.walk(root):
+        for f in files:
+            if f.startswith(prefix):
+                full = os.path.join(dirpath, f)
+                if path_contains is None or path_contains in full:
+                    results.append(full)
+    return results
+
+
 def _find_suffix(root, suffix):
     for dirpath, _, files in os.walk(root):
         for f in files:
@@ -162,8 +240,8 @@ def _chmod_x(path):
 # ---------------------------------------------------------------- 设备
 def build_serial_map(devices):
     m = {}
-    for s, mode in devices:
-        m.setdefault(mode, s)
+    for d in devices:
+        m.setdefault(d[1], d[0])
     return m
 
 
@@ -174,6 +252,14 @@ def serial_for_target(target, serial_map, force_serial=""):
 
 
 # ---------------------------------------------------------------- 刷机例程
+def _big_pkg_platform_ok(log):
+    """大包刷机依赖包内 platform-tools/linux/fastboot, 仅支持 Linux。"""
+    if sys.platform == "darwin":
+        log("[ERROR] macOS 不支持大包刷机 (依赖包内 Linux 版 fastboot), 请在 Linux 电脑上刷")
+        return False
+    return True
+
+
 def flash_big(target, pkg, serial, work_root, log, dry_run):
     work = _work_dir_for(pkg, work_root)
     if dry_run:
@@ -181,11 +267,15 @@ def flash_big(target, pkg, serial, work_root, log, dry_run):
         log(f"[DRY-RUN] cd <pkg>/flash_tools && ./adc_flashall.sh {serial}")
         log("[INFO] adc_flashall.sh 自行进入 fastboot (auto_fastboot_by_usb_id.sh)")
         return True
+    if not _big_pkg_platform_ok(log):
+        return False
     if not extract_pkg(pkg, work, log):
         return False
     flashall = _find_file(work, "adc_flashall.sh", path_contains="flash_tools")
     if not flashall:
         log(f"[ERROR] flash_tools/adc_flashall.sh not found in {pkg}")
+        return False
+    if not _check_tmp_space(log):
         return False
     _chmod_x(flashall)
     log(f"[INFO] Flash BIG {target} via adc_flashall.sh (serial={serial})")
@@ -244,9 +334,13 @@ def flash_big_extracted(target, extracted_dir, serial, log, dry_run):
     if dry_run:
         log(f"[DRY-RUN] cd {extracted_dir}/flash_tools && ./adc_flashall.sh {serial}")
         return True
+    if not _big_pkg_platform_ok(log):
+        return False
     flashall = _find_file(extracted_dir, "adc_flashall.sh", path_contains="flash_tools")
     if not flashall:
         log(f"[ERROR] flash_tools/adc_flashall.sh not found in {extracted_dir}")
+        return False
+    if not _check_tmp_space(log):
         return False
     _chmod_x(flashall)
     log(f"[INFO] Flash BIG {target} via adc_flashall.sh (serial={serial})")
@@ -356,13 +450,17 @@ def _do_flash_vlmu_mcu_direct(ota_pkg, serial, log):
 def _do_flash_vlmu_mcu(extracted_dir, serial, log):
     """执行 VLMU MCU 升级的实际逻辑。"""
     # 查找内层 OTA 包 (OTAPackage/VLMUMCU_*.zip)
-    ota_pkg = _find_file_with_prefix(extracted_dir, "VLMUMCU_", path_contains="OTAPackage")
-    if not ota_pkg:
-        # 尝试直接查找 VLMUMCU_*.zip
-        ota_pkg = _find_file_with_prefix(extracted_dir, "VLMUMCU_")
-        if not ota_pkg:
-            log(f"[ERROR] VLMUMCU_*.zip not found in {extracted_dir}")
-            return False
+    matches = _find_files_with_prefix(extracted_dir, "VLMUMCU_", path_contains="OTAPackage")
+    if not matches:
+        matches = _find_files_with_prefix(extracted_dir, "VLMUMCU_")
+    if not matches:
+        log(f"[ERROR] VLMUMCU_*.zip not found in {extracted_dir}")
+        return False
+    if len(matches) > 1:
+        log(f"[WARN] 找到 {len(matches)} 个 VLMUMCU 包, 使用最新的:")
+        for m in matches:
+            log(f"[WARN]   {os.path.basename(m)}")
+    ota_pkg = max(matches, key=os.path.getmtime)
     
     ota_filename = os.path.basename(ota_pkg)
     log(f"[INFO] Found VLMU MCU OTA package: {ota_filename}")
@@ -382,8 +480,6 @@ def _do_flash_vlmu_mcu(extracted_dir, serial, log):
 
 def _run_vlmu_mcu_upgrade(ota_filename, serial, log):
     """在 VLMU 设备上执行升级命令。"""
-    import time
-    
     # Step 1: killall -9 update_service
     log("[INFO] Step 1: killall -9 update_service")
     rc = common.run_streaming(
@@ -431,7 +527,7 @@ source /xpilot/xlauncher/scripts/env.bash
         # 我们通过读取日志文件来监控进度
         log("[INFO] Step 3: Running update_service (monitoring log file)...")
         
-        # 启动一个后台线程来执行脚本
+        # 启动 adb shell 执行升级脚本, 登记到进程表以便 GUI 关窗时清理
         import subprocess
         proc = subprocess.Popen(
             ["adb", "-s", serial, "shell", "/tmp/start_vlmu_mcu.sh"],
@@ -439,11 +535,10 @@ source /xpilot/xlauncher/scripts/env.bash
             stderr=subprocess.DEVNULL,
             stdin=subprocess.DEVNULL
         )
+        common.track_proc(proc)
         
         # 监控日志文件
         log("[INFO] Step 4: Monitoring upgrade progress from log file...")
-        last_line_count = 0
-        upgrade_completed = False
         
         for i in range(600):  # 最多等待 10 分钟
             time.sleep(1)
@@ -456,12 +551,6 @@ source /xpilot/xlauncher/scripts/env.bash
             
             # 每 5 秒读取一次日志
             if i % 5 == 0:
-                log_output = []
-                common.run_streaming(
-                    ["adb", "-s", serial, "shell", "tail -20 /xdata/log/latest/update_service.txt.log"],
-                    log=lambda x: log_output.append(x)
-                )
-                
                 # 检查进度
                 progress_output = []
                 common.run_streaming(
@@ -495,7 +584,6 @@ source /xpilot/xlauncher/scripts/env.bash
                 
                 if success_output:
                     log(f"[OK] Upgrade completed successfully at {i}s")
-                    upgrade_completed = True
                     break
                 
                 # 检查是否失败
@@ -514,6 +602,7 @@ source /xpilot/xlauncher/scripts/env.bash
                     log(f"[WARN] Process exited but no clear success/fail flag found")
                     break
     finally:
+        common.untrack_proc(proc)
         # 清理本地临时文件
         try:
             os.unlink(local_script)
@@ -554,9 +643,6 @@ def _run_job(kind, target, pkg, serial, work_root, log, dry_run):
     log(f"[OK] ==> Target: {target}  [{kind}]")
     log(f"[INFO]   package : {os.path.basename(pkg)}")
     log(f"[INFO]   device  : {serial or '<none detected>'}")
-    if not dry_run and not serial:
-        log(f"[WARN]   no matching device online for '{target}' — skipped")
-        return True
     if kind == "big":
         return flash_big(target, pkg, serial, work_root, log, dry_run)
     if kind == "small":
@@ -569,15 +655,12 @@ def _run_job(kind, target, pkg, serial, work_root, log, dry_run):
     return False
 
 
-def _run_job_extracted(kind, target, extracted_dir, serial, work_root, log, dry_run):
+def _run_job_extracted(kind, target, extracted_dir, serial, log, dry_run):
     """处理已解压目录的刷机任务, 跳过解压步骤。"""
     log(f"[OK] ==> Target: {target}  [{kind}]")
     log(f"[INFO]   extracted dir : {os.path.basename(extracted_dir)}")
     log(f"[INFO]   device  : {serial or '<none detected>'}")
-    if not dry_run and not serial:
-        log(f"[WARN]   no matching device online for '{target}' — skipped")
-        return True
-    
+
     if kind == "big":
         return flash_big_extracted(target, extracted_dir, serial, log, dry_run)
     if kind == "small":
@@ -626,29 +709,40 @@ def expand_targets(targets):
 
 
 def detect_and_log(log):
-    """检测设备并打印, 返回 [(serial, mode), ...]。"""
+    """检测设备并打印, 返回 [(serial, mode, source), ...]。"""
     log("[OK] ==> Detecting connected devices...")
     devices = common.detect_devices()
-    for s, m in devices:
-        log(f"[INFO]   {s} -> ChipMode: {m}")
+    for d in devices:
+        s, m = d[0], d[1]
+        src = d[2] if len(d) > 2 else "adb"
+        suffix = " (fastboot 模式)" if src == "fastboot" else ""
+        log(f"[INFO]   {s} -> ChipMode: {m}{suffix}")
     if not devices:
-        log("[WARN]   no adb devices online")
+        log("[WARN]   no adb/fastboot devices online")
     log("")
     return devices
 
 
-def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None):
+def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
+                 results_out=None):
     """按给定顺序执行 job 列表 [(kind, target, pkg_path, is_extracted), ...]。
 
     失败即停并返回 False (与 flash.sh 的 exit 语义一致)。全成功返回 True。
     devices 可传入已探测的 [(serial, mode)] 以跳过重复检测。
     is_extracted: True 表示 pkg_path 是已解压目录, 跳过解压步骤。
+    results_out: 可选 list, 追加 {kind,target,name,status} 供 GUI 汇总;
+                 status = ok|failed|skipped。所有任务都因无设备被跳过时判失败。
     """
     if devices is None:
         devices = detect_and_log(log)
     serial_map = build_serial_map(devices)
+    # 小包/MCU/VLMU MCU 走 adb, 只能用 adb 在线设备; 大包走 fastboot, 两种均可
+    adb_only = [d for d in devices if len(d) < 3 or d[2] != "fastboot"]
+    serial_map_adb = build_serial_map(adb_only)
 
     ok = True
+    executed = 0
+    skipped = 0
     for job in jobs:
         # 兼容旧格式 (3 元素) 和新格式 (4 元素)
         if len(job) == 3:
@@ -656,19 +750,39 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None):
             is_extracted = False
         else:
             kind, target, pkg, is_extracted = job
-        
-        serial = serial_for_target(target, serial_map, force_serial)
+
+        name = os.path.basename(pkg)
+        need_adb = kind in ("small", "mcu", "vlmu_mcu")
+        smap = serial_map_adb if need_adb else serial_map
+        serial = serial_for_target(target, smap, force_serial)
+        if not dry_run and not serial:
+            if need_adb and serial_for_target(target, serial_map, force_serial):
+                log(f"[WARN] '{target}' 设备处于 fastboot 模式, 仅支持大包, 跳过: {name}")
+            else:
+                log(f"[WARN] '{target}' 无在线匹配设备, 跳过: {name}")
+            skipped += 1
+            if results_out is not None:
+                results_out.append({"kind": kind, "target": target,
+                                    "name": name, "status": "skipped"})
+            continue
+
+        executed += 1
         if is_extracted:
-            # 已解压目录: work_root 就是目录本身
-            work_root = os.path.dirname(pkg)
-            if not _run_job_extracted(kind, target, pkg, serial, work_root, log, dry_run):
-                ok = False
-                break
+            job_ok = _run_job_extracted(kind, target, pkg, serial, log, dry_run)
         else:
-            if not _run_job(kind, target, pkg, serial, _work_root(pkg), log, dry_run):
-                ok = False
-                break
+            job_ok = _run_job(kind, target, pkg, serial, _work_root(pkg), log, dry_run)
+        if results_out is not None:
+            results_out.append({"kind": kind, "target": target,
+                                "name": name,
+                                "status": "ok" if job_ok else "failed"})
+        if not job_ok:
+            ok = False
+            break
         log("")
+
+    if not dry_run and jobs and executed == 0 and skipped > 0:
+        log("[ERROR] 所有任务均因无匹配设备被跳过, 未刷写任何内容")
+        ok = False
     return ok
 
 
@@ -702,9 +816,6 @@ def run_flash(prep_dir, targets, size_pref="auto", dry_run=False,
     jobs = plan_jobs(prep_dir, targets, size_pref)
     if not jobs:
         log(f"[WARN] No packages matched in {prep_dir} for the requested target(s).")
-
-    if not dry_run:
-        os.makedirs(os.path.join(prep_dir, ".extracted"), exist_ok=True)
 
     log("[OK] ==> Flash order: 大包 -> 小包 -> MCU")
     log("")
