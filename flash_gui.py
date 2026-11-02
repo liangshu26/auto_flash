@@ -1161,7 +1161,53 @@ class App:
                 self.status_var.set("超时, 正在取消...")
 
 
+_SINGLE_INSTANCE_LOCK_FH = None
+
+
+def acquire_single_instance_lock():
+    """尝试获取单实例锁。成功返回 True; 已有实例在运行返回 False。
+
+    用 flock 对以脚本目录为键的锁文件加独占非阻塞锁: 进程退出 (含崩溃) 时内核
+    自动释放, 因此不会残留死锁, 无需清理 pid 文件。锁文件放临时目录, 按脚本
+    绝对路径区分, 不同副本互不干扰。
+    """
+    global _SINGLE_INSTANCE_LOCK_FH
+    import hashlib
+    import tempfile
+    key = hashlib.md5(SCRIPT_DIR.encode("utf-8")).hexdigest()[:16]
+    lock_path = os.path.join(tempfile.gettempdir(), f"xp5_flash_gui_{key}.lock")
+    try:
+        fh = open(lock_path, "w")
+    except OSError:
+        return True                       # 建不了锁文件就不拦启动
+    try:
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:
+        return True                       # 非 POSIX 平台不做单实例限制
+    except OSError:
+        fh.close()
+        return False                      # 已有实例持锁
+    try:
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except OSError:
+        pass
+    _SINGLE_INSTANCE_LOCK_FH = fh         # 句柄常驻, 关闭即释放锁
+    return True
+
+
 def main():
+    if not acquire_single_instance_lock():
+        msg = "XP5 刷机工具已经在运行, 不能重复打开。请切换到已打开的窗口。"
+        try:
+            warn = tk.Tk()
+            warn.withdraw()
+            messagebox.showwarning("已在运行", msg)
+            warn.destroy()
+        except tk.TclError:
+            print(msg, file=sys.stderr)
+        return
     root = tk.Tk()
     try:
         ttk.Style().theme_use("clam")
