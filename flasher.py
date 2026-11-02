@@ -723,9 +723,9 @@ def expand_targets(targets):
     return [x for x in out if not (x in seen or seen.add(x))]
 
 
-def detect_and_log(log):
+def detect_and_log(log, header="[OK] ==> Detecting connected devices..."):
     """检测设备并打印, 返回 [(serial, mode, source), ...]。"""
-    log("[OK] ==> Detecting connected devices...")
+    log(header)
     devices = common.detect_devices()
     for d in devices:
         s, m = d[0], d[1]
@@ -738,33 +738,54 @@ def detect_and_log(log):
     return devices
 
 
+def _build_maps(devices):
+    """由设备列表构建各刷法可用的 serial 映射。
+
+    大包走 fastboot, adb/fastboot/ssh 均可 (all);
+    小包走 adb 或 ssh 网络部署, 排除 fastboot (small);
+    MCU/VLMU MCU 只能走 adb, 排除 fastboot 与 ssh (adb)。
+    source 记录每个 serial 的接入方式, 供小包选择部署脚本。
+    """
+    def src_of(d):
+        return d[2] if len(d) > 2 else "adb"
+
+    small_capable = [d for d in devices if src_of(d) != "fastboot"]
+    adb_only = [d for d in devices if src_of(d) == "adb"]
+    return {
+        "all": build_serial_map(devices),
+        "small": build_serial_map(small_capable),
+        "adb": build_serial_map(adb_only),
+        "source": {d[0]: src_of(d) for d in devices},
+    }
+
+
+# kind -> _build_maps 里对应的映射键
+KIND_MAP = {"big": "all", "small": "small", "mcu": "adb", "vlmu_mcu": "adb"}
+
+# 任务间重探时, 设备可能刚被上个任务刷重启: 最多再等这么久 (秒), 每 5s 探一次
+REBOOT_WAIT_SEC = 10
+REBOOT_POLL_SEC = 5
+
+
 def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
                  results_out=None):
     """按给定顺序执行 job 列表 [(kind, target, pkg_path, is_extracted), ...]。
 
     失败即停并返回 False (与 flash.sh 的 exit 语义一致)。全成功返回 True。
-    devices 可传入已探测的 [(serial, mode)] 以跳过重复检测。
+    devices 可传入已探测的 [(serial, mode, source)] 作为首个任务的初始快照;
+    之后每个任务开始前都会重新探测一次 (设备可能已重启或切换 adb/fastboot)。
     is_extracted: True 表示 pkg_path 是已解压目录, 跳过解压步骤。
     results_out: 可选 list, 追加 {kind,target,name,status} 供 GUI 汇总;
                  status = ok|failed|skipped。所有任务都因无设备被跳过时判失败。
     """
     if devices is None:
         devices = detect_and_log(log)
-    serial_map = build_serial_map(devices)
-    # serial -> source, 供小包判断走 adb 还是 ssh 部署脚本
-    serial_source = {d[0]: (d[2] if len(d) > 2 else "adb") for d in devices}
-    # 大包走 fastboot, adb/fastboot/ssh 均可 (serial_map);
-    # 小包走 adb 或 ssh 网络部署 (排除 fastboot);
-    # MCU/VLMU MCU 只能走 adb (排除 fastboot 与 ssh)。
-    small_capable = [d for d in devices if (d[2] if len(d) > 2 else "adb") != "fastboot"]
-    adb_only = [d for d in devices if (d[2] if len(d) > 2 else "adb") == "adb"]
-    serial_map_small = build_serial_map(small_capable)
-    serial_map_adb = build_serial_map(adb_only)
+    maps = _build_maps(devices)
 
     ok = True
     executed = 0
     skipped = 0
-    for job in jobs:
+    for idx, job in enumerate(jobs):
         # 兼容旧格式 (3 元素) 和新格式 (4 元素)
         if len(job) == 3:
             kind, target, pkg = job
@@ -772,16 +793,36 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
         else:
             kind, target, pkg, is_extracted = job
 
+        # 上一个任务可能已让设备重启或在 adb/fastboot 间切换, 快照会过期
+        # (例如 fastboot 刷完大包重启进 adb, 却仍被当成 fastboot 而跳过小包),
+        # 因此每个 job 开始前重新探测一次。
+        if idx and not dry_run:
+            devices = detect_and_log(
+                log, f"[INFO] ==> 重新探测设备 (任务 {idx + 1}/{len(jobs)})...")
+            maps = _build_maps(devices)
+
         name = os.path.basename(pkg)
-        if kind == "big":
-            smap = serial_map
-        elif kind == "small":
-            smap = serial_map_small
-        else:  # mcu / vlmu_mcu 仅 adb
-            smap = serial_map_adb
-        serial = serial_for_target(target, smap, force_serial)
+        map_key = KIND_MAP.get(kind, "all")
+        serial = serial_for_target(target, maps[map_key], force_serial)
+
+        # 上个任务可能刚把设备刷重启, adb/fastboot 还没回来, 最多再等 10s 重探。
+        # 只在"设备整体掉线"或"该 target 在线但接入方式不支持本刷法"时才等;
+        # 本来就没插这个 target 的设备, 不必白等。
+        waited = 0
+        while (not dry_run and not serial and waited < REBOOT_WAIT_SEC
+               and (not devices
+                    or serial_for_target(target, maps["all"], force_serial))):
+            log(f"[INFO] '{target}' 暂无可用设备 (可能正在重启), "
+                f"{REBOOT_POLL_SEC}s 后重新探测...")
+            time.sleep(REBOOT_POLL_SEC)
+            waited += REBOOT_POLL_SEC
+            devices = detect_and_log(
+                log, f"[INFO] ==> 重新探测设备 (任务 {idx + 1}/{len(jobs)})...")
+            maps = _build_maps(devices)
+            serial = serial_for_target(target, maps[map_key], force_serial)
+
         if not dry_run and not serial:
-            if serial_for_target(target, serial_map, force_serial):
+            if serial_for_target(target, maps["all"], force_serial):
                 # 设备在线但不满足该刷法: fastboot 只能刷大包; ssh 不能刷 MCU
                 log(f"[WARN] '{target}' 设备当前接入方式不支持刷 {kind}, 跳过: {name}")
             else:
@@ -792,7 +833,7 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
                                     "name": name, "status": "skipped"})
             continue
 
-        dev_source = serial_source.get(serial, "adb") if serial else "adb"
+        dev_source = maps["source"].get(serial, "adb") if serial else "adb"
         executed += 1
         if is_extracted:
             job_ok = _run_job_extracted(kind, target, pkg, serial, log, dry_run, dev_source)
