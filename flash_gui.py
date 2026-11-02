@@ -260,8 +260,8 @@ class App:
         ttk.Label(watch_row, text="(可用取消按钮停止轮询)", 
                   foreground="#999", font=('Helvetica', 8)).pack(side="left")
         
-        # 直接链接下载 (无需 DT 号, 适用于 RC 等直链)
-        url_frame = ttk.LabelFrame(main_frame, text="  直接链接下载 (无需 DT 号)  ")
+        # 直接链接下载 (无需 DT 号, 适用于 RC 等直链; 由"开始下载"一并触发)
+        url_frame = ttk.LabelFrame(main_frame, text="  直接链接 (无需 DT 号, 与上方 DT 一起由\"开始下载\"触发)  ")
         url_frame.pack(fill="x", padx=10, pady=(0, 10))
         self.url_text = tk.Text(url_frame, height=3, font=('Consolas', 9),
                                 wrap="none", relief="solid", borderwidth=1)
@@ -270,10 +270,6 @@ class App:
         url_bar.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Label(url_bar, text="每行一个完整 http(s) 链接",
                   foreground="#888", font=('Helvetica', 8)).pack(side="left")
-        self.btn_download_url = ttk.Button(url_bar, text="下载链接",
-                                           command=self.on_download_url,
-                                           style='Success.TButton')
-        self.btn_download_url.pack(side="right")
 
         # 下载按钮
         bar = ttk.Frame(main_frame)
@@ -623,9 +619,8 @@ class App:
 
     # ------------------------------------------------------------ 下载
     def _collect_download_tasks(self):
+        """收集 DT 任务, 返回 (platform, tasks)。platform 可能为空 (纯链接下载时不需要)。"""
         platform = self.platform_var.get().strip()
-        if not platform:
-            return None, [], "请先填车型 (如 E29)。"
         tasks = []
         # vlmu: 大包+小包 (分别填 DT)
         vlmu = self.dt_vars["vlmu"]
@@ -647,9 +642,14 @@ class App:
         mcu_dt = self.dt_vars["mcu"]["mcu"].get().strip()
         if mcu_dt:
             tasks.append(("mcu", mcu_dt))
-        if not tasks:
-            return None, [], "没有可下载的任务 (至少填一个 DT 号)。"
-        return platform, tasks, None
+        return platform, tasks
+
+    def _collect_urls(self):
+        """从直链文本框收集 URL, 返回 (urls, bad)。bad 为非 http(s) 的行。"""
+        raw = self.url_text.get("1.0", "end").strip()
+        urls = [u.strip() for u in raw.splitlines() if u.strip()]
+        bad = [u for u in urls if not u.startswith(("http://", "https://"))]
+        return urls, bad
 
     def on_download(self):
         try:
@@ -657,16 +657,26 @@ class App:
             if self._busy:
                 self._log("warn", "[WARN] 当前有任务在运行, 请等待结束后再操作\n")
                 return
-            platform, tasks, err = self._collect_download_tasks()
-            if err:
-                self._log("err", f"[ERROR] 无法下载: {err}\n")
-                self._modal_ask(messagebox.showwarning, "无法下载", err)
+
+            urls, bad = self._collect_urls()
+            if bad:
+                self._modal_ask(messagebox.showwarning, "链接无效",
+                                "以下不是 http(s) 链接:\n" + "\n".join(bad))
                 return
-            
-            # 读取轮询设置
+            platform, tasks = self._collect_download_tasks()
+            if not tasks and not urls:
+                self._modal_ask(messagebox.showwarning, "无法下载",
+                                "请至少填写一个 DT 号, 或粘贴一个下载链接。")
+                return
+            if tasks and not platform:
+                self._modal_ask(messagebox.showwarning, "无法下载",
+                                "填了 DT 号需要先填车型 (如 E29)。")
+                return
+
+            # 读取轮询设置 (仅对 DT 任务有意义)
             watch = 0
             timeout_hrs = 24
-            if self.watch_enabled_var.get():
+            if tasks and self.watch_enabled_var.get():
                 try:
                     watch = int(self.watch_interval_var.get().strip())
                     if watch <= 0:
@@ -679,18 +689,29 @@ class App:
                         timeout_hrs = 24
                 except ValueError:
                     timeout_hrs = 24
-            
+
             custom = self.dl_dir_var.get().strip()
             session_dir = custom or os.path.join(PREP_ROOT, datetime.now().strftime("%Y%m%d_%H%M%S"))
 
-            plan = "\n".join(f"  {t}  DT: {dts}" for t, dts in tasks)
+            # 组装确认信息: DT 计划 + 直链
+            plan_lines = []
+            if tasks:
+                plan_lines.append("DT 下载计划:")
+                plan_lines += [f"  {t}  DT: {dts}" for t, dts in tasks]
+            if urls:
+                if plan_lines:
+                    plan_lines.append("")
+                plan_lines.append("直链下载:")
+                plan_lines += ["  " + os.path.basename(u.split("?")[0]) for u in urls]
+            plan = "\n".join(plan_lines)
+            head = f"车型: {platform}\n\n" if tasks else ""
             watch_info = ""
             if watch > 0:
                 watch_info = f"\n\n轮询模式: 每 {watch} 分钟检查一次\n超时时间: {timeout_hrs} 小时"
-            
+
             if not self._modal_ask(
                     messagebox.askyesno,
-                    "确认下载", f"车型: {platform}\n\n下载计划:\n{plan}\n\n"
+                    "确认下载", f"{head}{plan}\n\n"
                                 f"目标目录:\n  {session_dir}{watch_info}\n\n开始下载?"):
                 return
 
@@ -701,12 +722,20 @@ class App:
                 return
 
             def job(log, progress_cb):
-                fail = downloader.run_download(
-                    platform, tasks, session_dir, log=log,
-                    all_=True, watch=watch, timeout_hrs=timeout_hrs,
-                    cancel_cb=lambda: self._cancelled,
-                    pause_cb=lambda: self._paused,
-                    progress_cb=progress_cb)
+                fail = 0
+                if tasks:
+                    fail += downloader.run_download(
+                        platform, tasks, session_dir, log=log,
+                        all_=True, watch=watch, timeout_hrs=timeout_hrs,
+                        cancel_cb=lambda: self._cancelled,
+                        pause_cb=lambda: self._paused,
+                        progress_cb=progress_cb)
+                if urls and not self._cancelled:
+                    fail += downloader.run_download_urls(
+                        urls, session_dir, log=log,
+                        cancel_cb=lambda: self._cancelled,
+                        pause_cb=lambda: self._paused,
+                        progress_cb=progress_cb)
                 return fail == 0
 
             def after():
@@ -721,57 +750,6 @@ class App:
             self._run_task(job, task_desc, after=after, watchdog_min=watchdog)
         except Exception as e:
             self._log("err", f"[ERROR] 下载按钮异常: {type(e).__name__}: {e}\n")
-            import traceback
-            traceback.print_exc()
-
-    def on_download_url(self):
-        """直接按链接下载 (无需 DT 号)。文本框每行一个完整 http(s) 链接。"""
-        try:
-            if self._busy:
-                self._log("warn", "[WARN] 当前有任务在运行, 请等待结束后再操作\n")
-                return
-            raw = self.url_text.get("1.0", "end").strip()
-            urls = [u.strip() for u in raw.splitlines() if u.strip()]
-            if not urls:
-                self._modal_ask(messagebox.showwarning, "无法下载", "请先粘贴至少一个完整链接。")
-                return
-            bad = [u for u in urls if not u.startswith(("http://", "https://"))]
-            if bad:
-                self._modal_ask(messagebox.showwarning, "链接无效",
-                                "以下不是 http(s) 链接:\n" + "\n".join(bad))
-                return
-
-            custom = self.dl_dir_var.get().strip()
-            session_dir = custom or os.path.join(
-                PREP_ROOT, datetime.now().strftime("%Y%m%d_%H%M%S"))
-            names = "\n".join("  " + os.path.basename(u.split("?")[0]) for u in urls)
-            if not self._modal_ask(
-                    messagebox.askyesno, "确认下载",
-                    f"将从直链下载 {len(urls)} 个文件:\n{names}\n\n"
-                    f"目标目录:\n  {session_dir}\n\n开始下载?"):
-                return
-
-            try:
-                os.makedirs(session_dir, exist_ok=True)
-            except OSError as e:
-                self._modal_ask(messagebox.showerror, "失败", f"无法创建下载目录: {e}")
-                return
-
-            def job(log, progress_cb):
-                fail = downloader.run_download_urls(
-                    urls, session_dir, log=log,
-                    cancel_cb=lambda: self._cancelled,
-                    pause_cb=lambda: self._paused,
-                    progress_cb=progress_cb)
-                return fail == 0
-
-            def after():
-                self._reload_dir_suggestions()
-                self.dir_var.set(session_dir)
-
-            self._run_task(job, f"直链下载到 {session_dir}", after=after, watchdog_min=240)
-        except Exception as e:
-            self._log("err", f"[ERROR] 直链下载异常: {type(e).__name__}: {e}\n")
             import traceback
             traceback.print_exc()
 
@@ -888,7 +866,7 @@ class App:
     def _set_busy(self, busy):
         self._busy = busy
         state = ("disabled" if busy else "normal")
-        for w in (self.btn_download, self.btn_download_url, self.btn_flash_all,
+        for w in (self.btn_download, self.btn_flash_all,
                   self.btn_refresh_dev, self.btn_refresh_sess):
             try:
                 w.configure(state=state)

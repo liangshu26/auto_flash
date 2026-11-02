@@ -169,9 +169,12 @@ def find_files(path, filter_str="", log=default_log):
     return results
 
 
-def _download_once(key, dest_dir, log=default_log, timeout=120, cancel_cb=None, pause_cb=None, progress_cb=None):
+def _download_once(key, dest_dir, log=default_log, timeout=30, cancel_cb=None, pause_cb=None, progress_cb=None):
     """下载单个文件到 dest_dir, 支持断点续传 (Range)。成功返回 True。
 
+    timeout 是 socket 读超时 (秒): 连接卡死时最多等这么久就中断, 交由上层续传重试,
+    因此设得较短 (30s) 以便快速从卡顿中自动恢复; 慢但存活的连接 (每 64KB 远快于 30s)
+    不受影响。
     cancel_cb: 可选, 无参函数, 返回 True 表示应取消下载。
     pause_cb: 可选, 无参函数, 返回 True 表示应暂停下载。
     progress_cb: 可选, 函数签名 (written, total, speed, eta_str), 用于实时更新进度。
@@ -251,7 +254,7 @@ def _download_once(key, dest_dir, log=default_log, timeout=120, cancel_cb=None, 
                     try:
                         chunk = r.read(64 * 1024)  # 64KB chunks, 更频繁检查取消
                     except Exception as e:
-                        log(f"[ERROR] 读取中断 {filename}: {e}")
+                        log(f"[WARN] 连接中断 {filename}: {e}")
                         return False
                     if not chunk:
                         break
@@ -290,11 +293,21 @@ def _download_once(key, dest_dir, log=default_log, timeout=120, cancel_cb=None, 
             log(f"[ERROR] 写入中断 {filename}: {e}")
             return False
 
-    # 下载完成后验证文件大小
+    # 下载完成后校验完整性: 优先用 HEAD 得到的 server_size, 退化用 Content-Length 推算的 total
+    expected = server_size or (total or 0)
     final_size = os.path.getsize(dest) if os.path.exists(dest) else 0
-    if server_size > 0 and final_size != server_size:
-        log(f"[ERROR] 文件大小不匹配: 期望 {format_size(server_size)}, 实际 {format_size(final_size)}")
-        log(f"[ERROR] 文件可能损坏, 请删除后重新下载: {dest}")
+    if expected and final_size < expected:
+        # 连接中断导致没下完 (不是损坏): 上层会带 Range 续传重试
+        log(f"[WARN] 下载不完整 ({format_size(final_size)}/{format_size(expected)}), "
+            f"连接中断, 将自动续传重试: {filename}")
+        return False
+    if server_size and final_size > server_size:
+        log(f"[ERROR] 文件超出预期大小 ({format_size(final_size)} > {format_size(server_size)}), "
+            f"删除重下: {filename}")
+        try:
+            os.remove(dest)
+        except OSError:
+            pass
         return False
 
     if progress_cb:
@@ -343,11 +356,12 @@ def check_md5(key, path, log=default_log, timeout=30):
     return True
 
 
-def download_file(key, dest_dir, log=default_log, timeout=120, cancel_cb=None,
-                  pause_cb=None, progress_cb=None, retries=3, verify=True):
+def download_file(key, dest_dir, log=default_log, timeout=30, cancel_cb=None,
+                  pause_cb=None, progress_cb=None, retries=5, verify=True):
     """下载单个文件 (含失败自动重试 + MD5 校验)。成功返回 True。
 
-    网络类失败自动重试 (断点续传, 不从头下); MD5 不匹配则删除文件重下。
+    网络类失败 (含连接中断/卡死超时) 自动重试并带 Range 续传, 不从头下;
+    MD5 不匹配则删除文件重下。timeout 为 socket 读超时, 见 _download_once。
     """
     filename = _filename_of(_resolve_url(key))
     for attempt in range(1, retries + 1):
