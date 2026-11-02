@@ -260,6 +260,21 @@ class App:
         ttk.Label(watch_row, text="(可用取消按钮停止轮询)", 
                   foreground="#999", font=('Helvetica', 8)).pack(side="left")
         
+        # 直接链接下载 (无需 DT 号, 适用于 RC 等直链)
+        url_frame = ttk.LabelFrame(main_frame, text="  直接链接下载 (无需 DT 号)  ")
+        url_frame.pack(fill="x", padx=10, pady=(0, 10))
+        self.url_text = tk.Text(url_frame, height=3, font=('Consolas', 9),
+                                wrap="none", relief="solid", borderwidth=1)
+        self.url_text.pack(fill="x", padx=8, pady=(8, 4))
+        url_bar = ttk.Frame(url_frame)
+        url_bar.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Label(url_bar, text="每行一个完整 http(s) 链接",
+                  foreground="#888", font=('Helvetica', 8)).pack(side="left")
+        self.btn_download_url = ttk.Button(url_bar, text="下载链接",
+                                           command=self.on_download_url,
+                                           style='Success.TButton')
+        self.btn_download_url.pack(side="right")
+
         # 下载按钮
         bar = ttk.Frame(main_frame)
         bar.pack(fill="x", padx=10, pady=12)
@@ -555,11 +570,13 @@ class App:
                 var.set(False)
 
     # ------------------------------------------------------------ 设备
-    def refresh_devices(self):
+    def refresh_devices(self, quiet=False):
+        """检测设备。quiet=True 时不显示"正在检测设备...", 结果到达后原地更新 (无感刷新)。"""
         if self._dev_busy:
             return
         self._dev_busy = True
-        self.dev_var.set("正在检测设备...")
+        if not quiet:
+            self.dev_var.set("正在检测设备...")
 
         def worker():
             devs = common.detect_devices()          # 重活只在子线程
@@ -707,6 +724,57 @@ class App:
             import traceback
             traceback.print_exc()
 
+    def on_download_url(self):
+        """直接按链接下载 (无需 DT 号)。文本框每行一个完整 http(s) 链接。"""
+        try:
+            if self._busy:
+                self._log("warn", "[WARN] 当前有任务在运行, 请等待结束后再操作\n")
+                return
+            raw = self.url_text.get("1.0", "end").strip()
+            urls = [u.strip() for u in raw.splitlines() if u.strip()]
+            if not urls:
+                self._modal_ask(messagebox.showwarning, "无法下载", "请先粘贴至少一个完整链接。")
+                return
+            bad = [u for u in urls if not u.startswith(("http://", "https://"))]
+            if bad:
+                self._modal_ask(messagebox.showwarning, "链接无效",
+                                "以下不是 http(s) 链接:\n" + "\n".join(bad))
+                return
+
+            custom = self.dl_dir_var.get().strip()
+            session_dir = custom or os.path.join(
+                PREP_ROOT, datetime.now().strftime("%Y%m%d_%H%M%S"))
+            names = "\n".join("  " + os.path.basename(u.split("?")[0]) for u in urls)
+            if not self._modal_ask(
+                    messagebox.askyesno, "确认下载",
+                    f"将从直链下载 {len(urls)} 个文件:\n{names}\n\n"
+                    f"目标目录:\n  {session_dir}\n\n开始下载?"):
+                return
+
+            try:
+                os.makedirs(session_dir, exist_ok=True)
+            except OSError as e:
+                self._modal_ask(messagebox.showerror, "失败", f"无法创建下载目录: {e}")
+                return
+
+            def job(log, progress_cb):
+                fail = downloader.run_download_urls(
+                    urls, session_dir, log=log,
+                    cancel_cb=lambda: self._cancelled,
+                    pause_cb=lambda: self._paused,
+                    progress_cb=progress_cb)
+                return fail == 0
+
+            def after():
+                self._reload_dir_suggestions()
+                self.dir_var.set(session_dir)
+
+            self._run_task(job, f"直链下载到 {session_dir}", after=after, watchdog_min=240)
+        except Exception as e:
+            self._log("err", f"[ERROR] 直链下载异常: {type(e).__name__}: {e}\n")
+            import traceback
+            traceback.print_exc()
+
     # ------------------------------------------------------------ 刷机
     def on_flash_selected(self):
         """刷写勾选的包。"""
@@ -820,7 +888,7 @@ class App:
     def _set_busy(self, busy):
         self._busy = busy
         state = ("disabled" if busy else "normal")
-        for w in (self.btn_download, self.btn_flash_all,
+        for w in (self.btn_download, self.btn_download_url, self.btn_flash_all,
                   self.btn_refresh_dev, self.btn_refresh_sess):
             try:
                 w.configure(state=state)
@@ -992,10 +1060,10 @@ class App:
             self._modal_ask(messagebox.showerror, "导出失败", str(e))
 
     def _auto_refresh_tick(self):
-        """空闲时每 15s 自动刷新设备列表 (任务运行中跳过, 避免干扰刷机)。"""
+        """空闲时每 15s 无感刷新设备列表 (任务运行中跳过, 避免干扰刷机)。"""
         try:
             if not self._busy and not self._dev_busy:
-                self.refresh_devices()
+                self.refresh_devices(quiet=True)
         except Exception:  # noqa
             pass
         finally:

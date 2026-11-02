@@ -30,6 +30,7 @@ import threading
 import argparse
 import urllib.request
 import urllib.error
+import urllib.parse
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
@@ -104,6 +105,19 @@ def _urlopen(req, timeout=60):
     return urllib.request.urlopen(req, timeout=timeout, context=_ssl_context())
 
 
+def _resolve_url(key_or_url):
+    """DT 流程传相对 key (拼到 BASE_URL 下); 直链流程传完整 http(s) URL, 原样返回。"""
+    if key_or_url.startswith(("http://", "https://")):
+        return key_or_url
+    return f"{BASE_URL}/{key_or_url}"
+
+
+def _filename_of(url):
+    """从 URL 取文件名, 去掉 query/fragment。"""
+    path = urllib.parse.urlparse(url).path
+    return os.path.basename(path) or "download"
+
+
 def browse(path, timeout=60):
     """GET {BASE_URL}/browse/{path} -> dict; 失败抛异常。"""
     url = f"{BASE_URL}/browse/{path}"
@@ -162,9 +176,9 @@ def _download_once(key, dest_dir, log=default_log, timeout=120, cancel_cb=None, 
     pause_cb: 可选, 无参函数, 返回 True 表示应暂停下载。
     progress_cb: 可选, 函数签名 (written, total, speed, eta_str), 用于实时更新进度。
     """
-    filename = os.path.basename(key)
+    filename = _filename_of(_resolve_url(key))
     dest = os.path.join(dest_dir, filename)
-    url = f"{BASE_URL}/{key}"
+    url = _resolve_url(key)
     os.makedirs(dest_dir, exist_ok=True)
 
     # 先获取服务器上的文件大小
@@ -302,8 +316,8 @@ def _file_md5(path, chunk=1 << 20):
 
 
 def check_md5(key, path, log=default_log, timeout=30):
-    """下载后与服务器上的 <key>.md5 校验。服务器无 .md5 或格式不识别时跳过 (返回 True)。"""
-    url = f"{BASE_URL}/{key}.md5"
+    """下载后与服务器上的 <url>.md5 校验。服务器无 .md5 或格式不识别时跳过 (返回 True)。"""
+    url = _resolve_url(key) + ".md5"
     req = urllib.request.Request(url, headers={"User-Agent": "xp5-downloader/1.0"})
     try:
         with _urlopen(req, timeout) as r:
@@ -335,7 +349,7 @@ def download_file(key, dest_dir, log=default_log, timeout=120, cancel_cb=None,
 
     网络类失败自动重试 (断点续传, 不从头下); MD5 不匹配则删除文件重下。
     """
-    filename = os.path.basename(key)
+    filename = _filename_of(_resolve_url(key))
     for attempt in range(1, retries + 1):
         if cancel_cb and cancel_cb():
             return False
@@ -599,6 +613,50 @@ def run_download(platform, tasks, dest_dir, log=default_log,
     return fail
 
 
+def run_download_urls(urls, dest_dir, log=default_log, cancel_cb=None,
+                      pause_cb=None, progress_cb=None):
+    """直接按完整 URL 下载 (无需 DT 号, 适用于 RC 等直链)。返回失败数 (0=全成功)。
+
+    urls 里的每个元素是完整 http(s) 链接; 复用 download_file 的续传/重试/MD5 逻辑。
+    """
+    urls = [u.strip() for u in urls if u and u.strip()]
+    if not urls:
+        log("[ERROR] 没有可下载的链接。")
+        return 1
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+    except OSError as e:
+        log(f"[ERROR] 无法创建下载目录 {dest_dir}: {e}")
+        return len(urls)
+
+    if len(urls) == 1:
+        u = urls[0]
+        log(f"\n[INFO] ==== 直链下载: {_filename_of(u)} ====")
+        if cancel_cb and cancel_cb():
+            log("[WARN] 下载已取消")
+            return 1
+        return 0 if download_file(u, dest_dir, log=log, cancel_cb=cancel_cb,
+                                  pause_cb=pause_cb, progress_cb=progress_cb) else 1
+
+    # 多链接: 最多 3 个并发, 聚合进度
+    agg = _ProgressAgg(progress_cb) if progress_cb else None
+
+    def one(u):
+        if cancel_cb and cancel_cb():
+            return False
+        log(f"\n[INFO] ==== 直链下载: {_filename_of(u)} ====")
+        cb = (lambda w, t, s, e, uu=u: agg.update(uu, w, t)) if agg else None
+        return download_file(u, dest_dir, log=log, cancel_cb=cancel_cb,
+                             pause_cb=pause_cb, progress_cb=cb)
+
+    fail = 0
+    with ThreadPoolExecutor(max_workers=min(3, len(urls))) as ex:
+        for res in ex.map(one, urls):
+            if not res:
+                fail += 1
+    return fail
+
+
 # ---------------------------------------------------------------- CLI
 def build_parser():
     p = argparse.ArgumentParser(
@@ -624,6 +682,8 @@ def build_parser():
                    help="可重复: 一次提交多个带类型的任务 (供 GUI 用), 如 "
                         "'vlmu-big:196163 196164'。给出时忽略位置 DT 与 -T")
     p.add_argument("-a", "--all", action="store_true", help="不询问, 下载全部匹配文件")
+    p.add_argument("--url", action="append", default=[], metavar="URL",
+                   help="可重复: 直接下载完整 URL (跳过 DT 流程, 适用于 RC 等直链)")
     p.add_argument("-w", "--watch", nargs="?", const=DEFAULT_WATCH_INTERVAL,
                    type=int, default=0, help="轮询模式, 每 N 分钟 (默认 10)")
     p.add_argument("-t", "--timeout", type=int, default=DEFAULT_TIMEOUT_HOURS,
@@ -639,6 +699,18 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.insecure:
         set_insecure(True)
+
+    # 直链模式: --url 直接给完整链接, 跳过 DT / 车型 / watch 流程
+    if args.url:
+        dest_dir = args.download_dir or os.path.join(
+            "flash_prep", datetime.now().strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(dest_dir, exist_ok=True)
+        fail = run_download_urls(args.url, dest_dir, log=default_log)
+        print()
+        if fail:
+            default_log(f"[WARN] {fail} 个链接下载失败。")
+        default_log(f"[OK] 下载完成, 文件保存在: {dest_dir}")
+        return 1 if fail else 0
 
     # GUI 模式: --task 直接给出带类型的多任务, 跳过位置 DT / -T / watch 解析
     if args.task:
