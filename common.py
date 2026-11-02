@@ -12,9 +12,11 @@ common.py — XP5 刷机工具共享逻辑
 
 import os
 import re
+import socket
 import subprocess
 import threading
 import time
+import concurrent.futures
 
 # ChipMode -> 刷机目标名 (与 bash 脚本一致)
 MODE_TO_TARGET = {"SoC_VLMU": "vlmu", "SoC_A": "xp5_a", "SoC_B": "xp5_b"}
@@ -134,23 +136,69 @@ def fastboot_board_type(serial, timeout=10):
     return m.group(1).upper() if m else ""
 
 
+# ------------------------------------------------------------------ ssh 设备
+# 固定 IP -> ChipMode: 免密 root SSH 的设备, 用于无 adb 直连时走网络刷小包。
+# deploy_xpilot.sh 对 xp5 用 `ssh root@<ip>` 部署, 无需 adb。
+SSH_DEVICES = {
+    "172.20.1.119": "SoC_VLMU",   # vlmu
+    "172.20.1.22": "SoC_A",       # xp5_a
+    "172.20.1.30": "SoC_B",       # xp5_b
+}
+SSH_PORT = 22
+
+
+def _ssh_reachable(ip, port=SSH_PORT, timeout=1.5):
+    """探测 ip:port 是否可连通 (SSH 端口开放即视为设备在线)。"""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def ssh_devices(timeout=1.5):
+    """并发探测固定 IP 的 SSH 端口, 返回可达的 [(ip, mode), ...] (按 SSH_DEVICES 顺序)。"""
+    ips = list(SSH_DEVICES)
+    reachable = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ips)) as ex:
+        futs = {ex.submit(_ssh_reachable, ip, SSH_PORT, timeout): ip for ip in ips}
+        for fut in concurrent.futures.as_completed(futs):
+            ip = futs[fut]
+            try:
+                if fut.result():
+                    reachable.add(ip)
+            except Exception:  # noqa
+                pass
+    return [(ip, SSH_DEVICES[ip]) for ip in ips if ip in reachable]
+
+
 def detect_devices(timeout=15):
-    """返回 [(serial, chipmode, source), ...]; source = 'adb' | 'fastboot'。
+    """返回 [(serial, chipmode, source), ...]; source = 'adb' | 'fastboot' | 'ssh'。
 
     adb 设备用 `adb shell version` 读 ChipMode; fastboot 设备读 board-type 映射,
-    使设备已处于 fastboot 模式时也能被识别并直接刷大包。
-    调用 adb/fastboot, 可能较慢, 调用方应放子线程。
+    使设备已处于 fastboot 模式时也能被识别并直接刷大包; ssh 设备按固定 IP 探测
+    22 端口 (免密 root SSH, 用于网络刷小包, serial 即 IP)。
+    同一 ChipMode 优先用 USB 直连 (adb/fastboot), 只有未被覆盖时才补 ssh 设备。
+    调用 adb/fastboot/网络探测, 可能较慢, 调用方应放子线程。
     """
     out = []
     seen = set()
+    seen_modes = set()
     for s in adb_devices(timeout):
         seen.add(s)
-        out.append((s, device_chipmode(s, timeout), "adb"))
+        m = device_chipmode(s, timeout)
+        seen_modes.add(m)
+        out.append((s, m, "adb"))
     for s in fastboot_devices(timeout):
         if s in seen:
             continue
         mode = BOARD_TYPE_TO_MODE.get(fastboot_board_type(s), "unknown")
+        seen_modes.add(mode)
         out.append((s, mode, "fastboot"))
+    for ip, mode in ssh_devices():
+        if mode in seen_modes:
+            continue
+        out.append((ip, mode, "ssh"))
     return out
 
 

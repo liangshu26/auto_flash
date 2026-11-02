@@ -583,7 +583,7 @@ class App:
                 note = "fastboot 设备, board-type 未知" if src == "fastboot" else "识别失败, 会自动重试"
                 lines.append(f"{s}  [{note}] -> -")
             else:
-                mode_txt = f"{m} | fastboot" if src == "fastboot" else m
+                mode_txt = {"fastboot": f"{m} | fastboot", "ssh": f"{m} | ssh"}.get(src, m)
                 lines.append(f"{s}  [{mode_txt}] -> {MODE_TO_TARGET.get(m, '-')}")
         self.dev_var.set("\n".join(lines))
         # 识别失败时把原因写进日志 (设备刚启动/adb 版本冲突/system 未就绪等)

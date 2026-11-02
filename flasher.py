@@ -5,7 +5,8 @@ flasher.py — 一键刷机 (flash.sh 的 Python 版)
 
 扫描待刷包目录, 按 ChipMode 自动匹配设备, 刷 xp5_a/xp5_b/vlmu/mcu:
   大包 -> <pkg>/flash_tools/adc_flashall.sh <serial>   (脚本自带 fastboot 流程)
-  小包 -> <pkg>/deploy_xpilot_by_adb.sh <xp5_vlmu|xp5_a|xp5_b>
+  小包 -> <pkg>/deploy_xpilot_by_adb.sh <xp5_vlmu|xp5_a|xp5_b>   (adb 设备)
+        / <pkg>/deploy_xpilot.sh <xp5_vlmu|xp5_a|xp5_b>          (ssh 网络设备, 免密 root)
   mcu  -> mcu.flash_mcu (adb A/B 双区, 从解压目录取 *_APPA.hex/*_APPB.hex)
 
 包分类按文件名前缀 (大小写敏感), 规则收敛在 common.classify:
@@ -287,25 +288,26 @@ def flash_big(target, pkg, serial, work_root, log, dry_run):
     return True
 
 
-def flash_small(target, pkg, work_root, log, dry_run):
+def flash_small(target, pkg, work_root, log, dry_run, use_ssh=False):
     stype = SMALL_TYPE.get(target, target)
+    script = "deploy_xpilot.sh" if use_ssh else "deploy_xpilot_by_adb.sh"
     work = _work_dir_for(pkg, work_root)
     if dry_run:
         log(f"[DRY-RUN] extract {pkg}")
-        log(f"[DRY-RUN] cd <pkg> && ./deploy_xpilot_by_adb.sh {stype}")
+        log(f"[DRY-RUN] cd <pkg> && ./{script} {stype}")
         return True
     if not extract_pkg(pkg, work, log):
         return False
-    deploy = _find_file(work, "deploy_xpilot_by_adb.sh")
+    deploy = _find_file(work, script)
     if not deploy:
-        log(f"[ERROR] deploy_xpilot_by_adb.sh not found in {pkg}")
+        log(f"[ERROR] {script} not found in {pkg}")
         return False
     _chmod_x(deploy)
-    log(f"[INFO] Flash SMALL {target} via deploy_xpilot_by_adb.sh {stype}")
+    log(f"[INFO] Flash SMALL {target} via {script} {stype} ({'SSH' if use_ssh else 'adb'})")
     rc = common.run_streaming(
-        ["./deploy_xpilot_by_adb.sh", stype], cwd=os.path.dirname(deploy), log=log)
+        [f"./{script}", stype], cwd=os.path.dirname(deploy), log=log)
     if rc != 0:
-        log(f"[ERROR] FAILED (rc={rc}): deploy_xpilot_by_adb.sh {target}")
+        log(f"[ERROR] FAILED (rc={rc}): {script} {target}")
         return False
     return True
 
@@ -352,22 +354,23 @@ def flash_big_extracted(target, extracted_dir, serial, log, dry_run):
     return True
 
 
-def flash_small_extracted(target, extracted_dir, log, dry_run):
+def flash_small_extracted(target, extracted_dir, log, dry_run, use_ssh=False):
     """小包刷机, 使用已解压目录。"""
     stype = SMALL_TYPE.get(target, target)
+    script = "deploy_xpilot.sh" if use_ssh else "deploy_xpilot_by_adb.sh"
     if dry_run:
-        log(f"[DRY-RUN] cd {extracted_dir} && ./deploy_xpilot_by_adb.sh {stype}")
+        log(f"[DRY-RUN] cd {extracted_dir} && ./{script} {stype}")
         return True
-    deploy = _find_file(extracted_dir, "deploy_xpilot_by_adb.sh")
+    deploy = _find_file(extracted_dir, script)
     if not deploy:
-        log(f"[ERROR] deploy_xpilot_by_adb.sh not found in {extracted_dir}")
+        log(f"[ERROR] {script} not found in {extracted_dir}")
         return False
     _chmod_x(deploy)
-    log(f"[INFO] Flash SMALL {target} via deploy_xpilot_by_adb.sh {stype}")
+    log(f"[INFO] Flash SMALL {target} via {script} {stype} ({'SSH' if use_ssh else 'adb'})")
     rc = common.run_streaming(
-        ["./deploy_xpilot_by_adb.sh", stype], cwd=os.path.dirname(deploy), log=log)
+        [f"./{script}", stype], cwd=os.path.dirname(deploy), log=log)
     if rc != 0:
-        log(f"[ERROR] FAILED (rc={rc}): deploy_xpilot_by_adb.sh {target}")
+        log(f"[ERROR] FAILED (rc={rc}): {script} {target}")
         return False
     return True
 
@@ -639,14 +642,15 @@ source /xpilot/xlauncher/scripts/env.bash
         return False
 
 
-def _run_job(kind, target, pkg, serial, work_root, log, dry_run):
+def _run_job(kind, target, pkg, serial, work_root, log, dry_run, dev_source="adb"):
     log(f"[OK] ==> Target: {target}  [{kind}]")
     log(f"[INFO]   package : {os.path.basename(pkg)}")
-    log(f"[INFO]   device  : {serial or '<none detected>'}")
+    log(f"[INFO]   device  : {serial or '<none detected>'}"
+        + (f"  ({dev_source})" if dev_source and dev_source != "adb" else ""))
     if kind == "big":
         return flash_big(target, pkg, serial, work_root, log, dry_run)
     if kind == "small":
-        return flash_small(target, pkg, work_root, log, dry_run)
+        return flash_small(target, pkg, work_root, log, dry_run, use_ssh=(dev_source == "ssh"))
     if kind == "mcu":
         return flash_mcu(pkg, serial, work_root, log, dry_run)
     if kind == "vlmu_mcu":
@@ -655,16 +659,18 @@ def _run_job(kind, target, pkg, serial, work_root, log, dry_run):
     return False
 
 
-def _run_job_extracted(kind, target, extracted_dir, serial, log, dry_run):
+def _run_job_extracted(kind, target, extracted_dir, serial, log, dry_run, dev_source="adb"):
     """处理已解压目录的刷机任务, 跳过解压步骤。"""
     log(f"[OK] ==> Target: {target}  [{kind}]")
     log(f"[INFO]   extracted dir : {os.path.basename(extracted_dir)}")
-    log(f"[INFO]   device  : {serial or '<none detected>'}")
+    log(f"[INFO]   device  : {serial or '<none detected>'}"
+        + (f"  ({dev_source})" if dev_source and dev_source != "adb" else ""))
 
     if kind == "big":
         return flash_big_extracted(target, extracted_dir, serial, log, dry_run)
     if kind == "small":
-        return flash_small_extracted(target, extracted_dir, log, dry_run)
+        return flash_small_extracted(target, extracted_dir, log, dry_run,
+                                     use_ssh=(dev_source == "ssh"))
     if kind == "mcu":
         return flash_mcu_extracted(extracted_dir, serial, log, dry_run)
     if kind == "vlmu_mcu":
@@ -715,10 +721,10 @@ def detect_and_log(log):
     for d in devices:
         s, m = d[0], d[1]
         src = d[2] if len(d) > 2 else "adb"
-        suffix = " (fastboot 模式)" if src == "fastboot" else ""
+        suffix = {"fastboot": " (fastboot 模式)", "ssh": " (ssh 网络)"}.get(src, "")
         log(f"[INFO]   {s} -> ChipMode: {m}{suffix}")
     if not devices:
-        log("[WARN]   no adb/fastboot devices online")
+        log("[WARN]   no adb/fastboot/ssh devices online")
     log("")
     return devices
 
@@ -736,8 +742,14 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
     if devices is None:
         devices = detect_and_log(log)
     serial_map = build_serial_map(devices)
-    # 小包/MCU/VLMU MCU 走 adb, 只能用 adb 在线设备; 大包走 fastboot, 两种均可
-    adb_only = [d for d in devices if len(d) < 3 or d[2] != "fastboot"]
+    # serial -> source, 供小包判断走 adb 还是 ssh 部署脚本
+    serial_source = {d[0]: (d[2] if len(d) > 2 else "adb") for d in devices}
+    # 大包走 fastboot, adb/fastboot/ssh 均可 (serial_map);
+    # 小包走 adb 或 ssh 网络部署 (排除 fastboot);
+    # MCU/VLMU MCU 只能走 adb (排除 fastboot 与 ssh)。
+    small_capable = [d for d in devices if (d[2] if len(d) > 2 else "adb") != "fastboot"]
+    adb_only = [d for d in devices if (d[2] if len(d) > 2 else "adb") == "adb"]
+    serial_map_small = build_serial_map(small_capable)
     serial_map_adb = build_serial_map(adb_only)
 
     ok = True
@@ -752,12 +764,17 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
             kind, target, pkg, is_extracted = job
 
         name = os.path.basename(pkg)
-        need_adb = kind in ("small", "mcu", "vlmu_mcu")
-        smap = serial_map_adb if need_adb else serial_map
+        if kind == "big":
+            smap = serial_map
+        elif kind == "small":
+            smap = serial_map_small
+        else:  # mcu / vlmu_mcu 仅 adb
+            smap = serial_map_adb
         serial = serial_for_target(target, smap, force_serial)
         if not dry_run and not serial:
-            if need_adb and serial_for_target(target, serial_map, force_serial):
-                log(f"[WARN] '{target}' 设备处于 fastboot 模式, 仅支持大包, 跳过: {name}")
+            if serial_for_target(target, serial_map, force_serial):
+                # 设备在线但不满足该刷法: fastboot 只能刷大包; ssh 不能刷 MCU
+                log(f"[WARN] '{target}' 设备当前接入方式不支持刷 {kind}, 跳过: {name}")
             else:
                 log(f"[WARN] '{target}' 无在线匹配设备, 跳过: {name}")
             skipped += 1
@@ -766,11 +783,12 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
                                     "name": name, "status": "skipped"})
             continue
 
+        dev_source = serial_source.get(serial, "adb") if serial else "adb"
         executed += 1
         if is_extracted:
-            job_ok = _run_job_extracted(kind, target, pkg, serial, log, dry_run)
+            job_ok = _run_job_extracted(kind, target, pkg, serial, log, dry_run, dev_source)
         else:
-            job_ok = _run_job(kind, target, pkg, serial, _work_root(pkg), log, dry_run)
+            job_ok = _run_job(kind, target, pkg, serial, _work_root(pkg), log, dry_run, dev_source)
         if results_out is not None:
             results_out.append({"kind": kind, "target": target,
                                 "name": name,
