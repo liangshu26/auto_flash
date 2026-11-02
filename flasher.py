@@ -122,8 +122,14 @@ def extract_pkg(pkg, dest, log):
     if _marker_valid(dest, pkg):
         log(f"[INFO] already extracted, reuse: {dest}")
         return True
-    if os.path.isdir(dest) and os.listdir(dest):
-        log(f"[WARN] 目录非空但无有效完成标记 (可能上次解压不完整), 重新解压: {dest}")
+    if os.path.isdir(dest):
+        # marker 无效: 可能是上次解压不完整的残留, 清空后重解压, 避免旧文件堆积
+        if os.listdir(dest):
+            log(f"[WARN] 目录非空但无有效完成标记 (可能上次解压不完整), 清空后重新解压: {dest}")
+        try:
+            shutil.rmtree(dest)
+        except OSError as e:
+            log(f"[WARN] 清理旧目录失败, 继续解压: {e}")
 
     # 磁盘空间预检: 镜像压缩率低, 按包大小 1.3 倍预留
     try:
@@ -134,35 +140,6 @@ def extract_pkg(pkg, dest, log):
             return False
     except OSError as e:
         log(f"[WARN] 无法检查磁盘空间: {e}")
-
-    # 先验证压缩包完整性
-    if pkg.endswith((".tar.gz", ".tgz")):
-        log(f"[INFO] 验证压缩包完整性: {os.path.basename(pkg)}")
-        try:
-            import gzip
-            # 尝试打开并读取 tar 文件头, 检查是否损坏
-            with tarfile.open(pkg, "r:gz") as tf:
-                members = tf.getmembers()
-                if not members:
-                    log(f"[ERROR] 压缩包为空: {os.path.basename(pkg)}")
-                    return False
-                log(f"[INFO] 压缩包包含 {len(members)} 个文件")
-        except tarfile.TarError as e:
-            log(f"[ERROR] 压缩包损坏 (tar 格式错误): {os.path.basename(pkg)}")
-            log(f"[ERROR] 错误详情: {e}")
-            log(f"[ERROR] 请删除文件后重新下载: {pkg}")
-            return False
-        except gzip.BadGzipFile as e:
-            log(f"[ERROR] 压缩包损坏 (gzip 格式错误): {os.path.basename(pkg)}")
-            log(f"[ERROR] 请删除文件后重新下载: {pkg}")
-            return False
-        except EOFError as e:
-            log(f"[ERROR] 压缩包不完整 (unexpected EOF): {os.path.basename(pkg)}")
-            log(f"[ERROR] 可能下载中断, 请删除后重新下载: {pkg}")
-            return False
-        except Exception as e:
-            log(f"[WARN] 验证压缩包时出错: {e}")
-            # 继续尝试解压, 让后续步骤报错
 
     os.makedirs(dest, exist_ok=True)
     log(f"[OK] ==> Extracting {os.path.basename(pkg)}")
