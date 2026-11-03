@@ -762,9 +762,17 @@ def _build_maps(devices):
 # kind -> _build_maps 里对应的映射键
 KIND_MAP = {"big": "all", "small": "small", "mcu": "adb", "vlmu_mcu": "adb"}
 
-# 任务间重探时, 设备可能刚被上个任务刷重启: 最多再等这么久 (秒), 每 5s 探一次
-REBOOT_WAIT_SEC = 10
-REBOOT_POLL_SEC = 5
+# 任务间重探时设备可能刚被上个任务刷重启 (小包 deploy 结尾就 reboot xpu),
+# adb/fastboot 要一两分钟才回来。上限对齐 aurix_v7_xp5.sh 的 wait_device_online
+# (60 次 x 5s = 300s); 这里每轮探测本身也要几秒, 故轮询间隔放宽到 10s。
+REBOOT_WAIT_SEC = 300
+REBOOT_POLL_SEC = 10
+
+
+def _targets_online(maps, force_serial=""):
+    """当前快照里哪些 target 有设备 (含 fastboot / ssh 接入)。"""
+    return {t for t in common.ALL_TARGETS
+            if serial_for_target(t, maps["all"], force_serial)}
 
 
 def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
@@ -781,6 +789,9 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
     if devices is None:
         devices = detect_and_log(log)
     maps = _build_maps(devices)
+    # 历次探测到过的 target, 用来区分"刚被上个任务刷重启"和"本来就没插这块板":
+    # 前者值得等它回来, 后者白等只会拖慢整批任务。
+    seen_targets = _targets_online(maps, force_serial)
 
     ok = True
     executed = 0
@@ -800,26 +811,26 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
             devices = detect_and_log(
                 log, f"[INFO] ==> 重新探测设备 (任务 {idx + 1}/{len(jobs)})...")
             maps = _build_maps(devices)
+            seen_targets |= _targets_online(maps, force_serial)
 
         name = os.path.basename(pkg)
         map_key = KIND_MAP.get(kind, "all")
         serial = serial_for_target(target, maps[map_key], force_serial)
 
-        # 上个任务可能刚把设备刷重启, adb/fastboot 还没回来, 最多再等 10s 重探。
-        # 只在"设备整体掉线"或"该 target 在线但接入方式不支持本刷法"时才等;
-        # 本来就没插这个 target 的设备, 不必白等。
-        waited = 0
-        while (not dry_run and not serial and waited < REBOOT_WAIT_SEC
-               and (not devices
-                    or serial_for_target(target, maps["all"], force_serial))):
-            log(f"[INFO] '{target}' 暂无可用设备 (可能正在重启), "
-                f"{REBOOT_POLL_SEC}s 后重新探测...")
-            time.sleep(REBOOT_POLL_SEC)
-            waited += REBOOT_POLL_SEC
-            devices = detect_and_log(
-                log, f"[INFO] ==> 重新探测设备 (任务 {idx + 1}/{len(jobs)})...")
-            maps = _build_maps(devices)
-            serial = serial_for_target(target, maps[map_key], force_serial)
+        # 设备刚被上个任务刷重启时, 它已从快照里彻底消失 (而不是"在线但接入方式
+        # 不对"), 所以判据只能是"这块板之前探测到过"。
+        if not dry_run and not serial and target in seen_targets:
+            log(f"[INFO] '{target}' 设备离线 (可能刚被上个任务刷重启), "
+                f"最多等待 {REBOOT_WAIT_SEC}s ...")
+            deadline = time.monotonic() + REBOOT_WAIT_SEC
+            while not serial and time.monotonic() < deadline:
+                time.sleep(REBOOT_POLL_SEC)
+                devices = detect_and_log(
+                    log, f"[INFO] ==> 等待 '{target}' 恢复 "
+                         f"(剩余 {max(0, int(deadline - time.monotonic()))}s)...")
+                maps = _build_maps(devices)
+                seen_targets |= _targets_online(maps, force_serial)
+                serial = serial_for_target(target, maps[map_key], force_serial)
 
         if not dry_run and not serial:
             if serial_for_target(target, maps["all"], force_serial):
