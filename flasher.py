@@ -616,7 +616,7 @@ source /xpilot/xlauncher/scripts/env.bash
         # 清理本地临时文件
         try:
             os.unlink(local_script)
-        except:
+        except OSError:
             pass
     
     # Step 5/6: 仅在监控阶段没得出结论时才兜底查询。
