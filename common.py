@@ -61,18 +61,33 @@ def adb_devices(timeout=15):
     return serials
 
 
-def device_chipmode(serial, timeout=15, retries=3):
+# 开机途中 `adb shell version` 会先吐前半段 (PDK version / Version / Branch /
+# Built Time) 再吐 ChipMode, 读到半截就判 unknown 会让这块板从 USB 列表里消失,
+# 接着被同 IP 的 ssh 设备顶替 —— 大包任务于是拿到一个 IP 当 fastboot 序列号。
+# 所以"有 version 输出但没有 ChipMode 字段"要多等几轮; 设备根本不存在 (stderr
+# 报错) 之类的硬失败不白等。
+CHIPMODE_RETRIES = 3
+CHIPMODE_TRUNCATED_RETRIES = 10
+CHIPMODE_RETRY_INTERVAL = 3
+
+
+def device_chipmode(serial, timeout=15, retries=CHIPMODE_RETRIES):
     """读取某设备的 ChipMode (SoC_VLMU/SoC_A/SoC_B); 失败返回 'unknown'。
 
     设备刚启动、adb server 被其他客户端 (版本不匹配的 adb) 重启、或系统未
     完全起来时, `adb shell version` 会短暂失败, 因此间隔重试, 减少误报 unknown。
+    拿到半截 version 输出 (开机途中) 时按 CHIPMODE_TRUNCATED_RETRIES 延长重试。
     最后一次失败的错误信息存入 last_chipmode_error 供界面/日志诊断。
     """
     global last_chipmode_error
     last_err = ""
-    for i in range(max(1, retries)):
+    budget = max(1, retries)
+    truncated = False
+    i = 0
+    while i < budget:
         if i:
-            time.sleep(1)
+            time.sleep(CHIPMODE_RETRY_INTERVAL if truncated else 1)
+        i += 1
         try:
             r = subprocess.run(
                 ["adb", "-s", serial, "shell", "version"],
@@ -88,6 +103,9 @@ def device_chipmode(serial, timeout=15, retries=3):
             last_chipmode_error = ""
             return m.group(1)
         err = strip_ctrl(r.stderr or "").strip()
+        if not err and out.strip():
+            truncated = True
+            budget = max(budget, CHIPMODE_TRUNCATED_RETRIES)
         last_err = err or f"version 输出中无 ChipMode 字段: {out.strip()[:120]!r}"
     last_chipmode_error = f"{serial}: {last_err}"
     return "unknown"

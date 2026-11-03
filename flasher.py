@@ -44,8 +44,10 @@ TARGET_MODE = {"vlmu": "SoC_VLMU", "xp5_a": "SoC_A",
 SMALL_TYPE = {"vlmu": "xp5_vlmu", "xp5_a": "xp5_a", "xp5_b": "xp5_b"}
 
 # deploy_xpilot*.sh 会吞掉失败: adb push 大面积报错后只打一句 "adb push error"
-# 就 exit 0 (实测 1409 files pushed + 数十条 adb: error, rc 仍为 0), 因此除退出码
-# 外还要扫输出里的硬失败标记。下面几条都是成功刷机不会出现的行。
+# 就 exit 0 (实测 1409 files pushed + 数十条 adb: error, rc 仍为 0); ssh 版同理,
+# 每条 ssh 都 "Connection closed by remote host"、远端版本号全读成空, 脚本只在
+# 结尾打一行 "ERROR: xpilot/version.txt missing EEA" 就 exit 0。因此除退出码外
+# 还要扫输出里的硬失败标记。下面几条都是成功刷机不会出现的行。
 # 注意: 不能把裸 "Permission denied" 当标记 —— 成功的那次也刷出几十行
 # "rm: cannot remove '/xpilot/...': Permission denied", 属正常噪声。
 DEPLOY_FAIL_MARKERS = (
@@ -53,7 +55,11 @@ DEPLOY_FAIL_MARKERS = (
     "adb: error: failed to copy",   # adb push 逐文件报错
     "ssh: connect to host",         # ssh 连不上
     "Permission denied (publickey",  # ssh 免密没配好
+    "kex_exchange_identification",  # ssh 密钥交换阶段就被断开 (设备重启中)
+    "Connection closed by",         # ssh/scp 被远端关闭
     "lost connection",              # scp/sftp 中断
+    # 脚本读不到远端 version.txt 时的中止行 (前缀是 xp5_a/xp5_b/xp5_vlmu, 故不带前缀)
+    "ERROR: xpilot/version.txt missing EEA",
 )
 
 ALL_ORDER = ("vlmu", "xp5_a", "xp5_b", "mcu")
@@ -761,7 +767,8 @@ def detect_and_log(log, header="[OK] ==> Detecting connected devices..."):
 def _build_maps(devices):
     """由设备列表构建各刷法可用的 serial 映射。
 
-    大包走 fastboot, adb/fastboot/ssh 均可 (all);
+    大包走 fastboot, 只认 USB 直连 (adb/fastboot): 把 ssh 的 IP 喂给
+    adc_flashall.sh 只会得到 "Doesn't have a device with serial number <IP>" (big);
     小包走 adb 或 ssh 网络部署, 排除 fastboot (small);
     MCU/VLMU MCU 只能走 adb, 排除 fastboot 与 ssh (adb)。
     source 记录每个 serial 的接入方式, 供小包选择部署脚本。
@@ -770,9 +777,11 @@ def _build_maps(devices):
         return d[2] if len(d) > 2 else "adb"
 
     small_capable = [d for d in devices if src_of(d) != "fastboot"]
+    usb_capable = [d for d in devices if src_of(d) != "ssh"]
     adb_only = [d for d in devices if src_of(d) == "adb"]
     return {
         "all": build_serial_map(devices),
+        "big": build_serial_map(usb_capable),
         "small": build_serial_map(small_capable),
         "adb": build_serial_map(adb_only),
         "source": {d[0]: src_of(d) for d in devices},
@@ -780,7 +789,7 @@ def _build_maps(devices):
 
 
 # kind -> _build_maps 里对应的映射键
-KIND_MAP = {"big": "all", "small": "small", "mcu": "adb", "vlmu_mcu": "adb"}
+KIND_MAP = {"big": "big", "small": "small", "mcu": "adb", "vlmu_mcu": "adb"}
 
 # 任务间重探时设备可能刚被上个任务刷重启 (小包 deploy 结尾就 reboot xpu),
 # adb/fastboot 要一两分钟才回来。上限对齐 aurix_v7_xp5.sh 的 wait_device_online
