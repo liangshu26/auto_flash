@@ -12,7 +12,6 @@ common.py — XP5 刷机工具共享逻辑
 
 import os
 import re
-import socket
 import subprocess
 import threading
 import time
@@ -147,17 +146,32 @@ SSH_DEVICES = {
 SSH_PORT = 22
 
 
-def _ssh_reachable(ip, port=SSH_PORT, timeout=1.5):
-    """探测 ip:port 是否可连通 (SSH 端口开放即视为设备在线)。"""
+def _ssh_reachable(ip, port=SSH_PORT, timeout=3):
+    """真用 ssh 登录一次 (远端跑 `true`), 成功才算设备在线。
+
+    只探 22 端口开没开是不够的: 端口通但免密 root 没配好、或这个 IP 被别的机器
+    占着时, GUI 会显示设备在线, 而 deploy_xpilot.sh 里的 ssh 会全部失败。
+    BatchMode=yes 禁止一切交互提示 (密码 / host key), 登不上就立刻失败。
+    """
     try:
-        with socket.create_connection((ip, port), timeout=timeout):
-            return True
-    except OSError:
+        r = subprocess.run(
+            ["ssh", "-p", str(port),
+             "-o", "BatchMode=yes",
+             "-o", f"ConnectTimeout={timeout}",
+             "-o", "StrictHostKeyChecking=no",
+             "-o", "UserKnownHostsFile=/dev/null",
+             "-o", "LogLevel=ERROR",
+             f"root@{ip}", "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, timeout=timeout + 3,
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
+    return r.returncode == 0
 
 
-def ssh_devices(timeout=1.5):
-    """并发探测固定 IP 的 SSH 端口, 返回可达的 [(ip, mode), ...] (按 SSH_DEVICES 顺序)。"""
+def ssh_devices(timeout=3):
+    """并发探测固定 IP 能否免密 ssh 登录, 返回可用的 [(ip, mode), ...] (按 SSH_DEVICES 顺序)。"""
     ips = list(SSH_DEVICES)
     reachable = set()
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(ips)) as ex:
@@ -176,8 +190,8 @@ def detect_devices(timeout=15):
     """返回 [(serial, chipmode, source), ...]; source = 'adb' | 'fastboot' | 'ssh'。
 
     adb 设备用 `adb shell version` 读 ChipMode; fastboot 设备读 board-type 映射,
-    使设备已处于 fastboot 模式时也能被识别并直接刷大包; ssh 设备按固定 IP 探测
-    22 端口 (免密 root SSH, 用于网络刷小包, serial 即 IP)。
+    使设备已处于 fastboot 模式时也能被识别并直接刷大包; ssh 设备按固定 IP 实登
+    一次 (免密 root SSH, 用于网络刷小包, serial 即 IP)。
     同一 ChipMode 优先用 USB 直连 (adb/fastboot), 只有未被覆盖时才补 ssh 设备。
     调用 adb/fastboot/网络探测, 可能较慢, 调用方应放子线程。
     """
@@ -491,3 +505,23 @@ def run_streaming(argv, cwd=None, log=print, env=None,
         return p.returncode
     finally:
         _proc_del(p)
+
+
+def run_streaming_checked(argv, cwd=None, log=print, fail_markers=(), env=None):
+    """同 run_streaming, 但额外扫输出里的硬失败标记, 返回 (rc, 命中的标记 or "")。
+
+    有些脚本会吞掉失败: 退出码为 0, 只在输出里留一句错误横幅, 光看 rc 会把
+    刷坏的板子判成成功。命中第一个标记后就停止扫描。
+    """
+    hits = []
+
+    def _log(line):
+        if not hits:
+            for m in fail_markers:
+                if m in line:
+                    hits.append(m)
+                    break
+        log(line)
+
+    rc = run_streaming(argv, cwd=cwd, log=_log, env=env)
+    return rc, (hits[0] if hits else "")

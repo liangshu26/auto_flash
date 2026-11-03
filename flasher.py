@@ -43,6 +43,19 @@ TARGET_MODE = {"vlmu": "SoC_VLMU", "xp5_a": "SoC_A",
 # 小包 deploy_xpilot_by_adb.sh 的类型参数
 SMALL_TYPE = {"vlmu": "xp5_vlmu", "xp5_a": "xp5_a", "xp5_b": "xp5_b"}
 
+# deploy_xpilot*.sh 会吞掉失败: adb push 大面积报错后只打一句 "adb push error"
+# 就 exit 0 (实测 1409 files pushed + 数十条 adb: error, rc 仍为 0), 因此除退出码
+# 外还要扫输出里的硬失败标记。下面几条都是成功刷机不会出现的行。
+# 注意: 不能把裸 "Permission denied" 当标记 —— 成功的那次也刷出几十行
+# "rm: cannot remove '/xpilot/...': Permission denied", 属正常噪声。
+DEPLOY_FAIL_MARKERS = (
+    "adb push error",               # 脚本自己的失败横幅
+    "adb: error: failed to copy",   # adb push 逐文件报错
+    "ssh: connect to host",         # ssh 连不上
+    "Permission denied (publickey",  # ssh 免密没配好
+    "lost connection",              # scp/sftp 中断
+)
+
 ALL_ORDER = ("vlmu", "xp5_a", "xp5_b", "mcu")
 
 
@@ -265,6 +278,23 @@ def flash_big(target, pkg, serial, work_root, log, dry_run):
     return True
 
 
+def _run_deploy(script_dir, script, stype, target, log):
+    """跑 deploy 脚本并判定成败。
+
+    退出码不可全信 (脚本会吞掉 adb push 失败), 所以再扫一遍输出里的硬失败标记。
+    """
+    rc, bad = common.run_streaming_checked(
+        [f"./{script}", stype], cwd=script_dir, log=log,
+        fail_markers=DEPLOY_FAIL_MARKERS)
+    if rc != 0:
+        log(f"[ERROR] FAILED (rc={rc}): {script} {target}")
+        return False
+    if bad:
+        log(f"[ERROR] FAILED: {script} {target} 退出码为 0, 但输出含失败标记: {bad}")
+        return False
+    return True
+
+
 def flash_small(target, pkg, work_root, log, dry_run, use_ssh=False):
     stype = SMALL_TYPE.get(target, target)
     script = "deploy_xpilot.sh" if use_ssh else "deploy_xpilot_by_adb.sh"
@@ -281,12 +311,7 @@ def flash_small(target, pkg, work_root, log, dry_run, use_ssh=False):
         return False
     _chmod_x(deploy)
     log(f"[INFO] Flash SMALL {target} via {script} {stype} ({'SSH' if use_ssh else 'adb'})")
-    rc = common.run_streaming(
-        [f"./{script}", stype], cwd=os.path.dirname(deploy), log=log)
-    if rc != 0:
-        log(f"[ERROR] FAILED (rc={rc}): {script} {target}")
-        return False
-    return True
+    return _run_deploy(os.path.dirname(deploy), script, stype, target, log)
 
 
 def flash_mcu(pkg, serial, work_root, log, dry_run):
@@ -344,12 +369,7 @@ def flash_small_extracted(target, extracted_dir, log, dry_run, use_ssh=False):
         return False
     _chmod_x(deploy)
     log(f"[INFO] Flash SMALL {target} via {script} {stype} ({'SSH' if use_ssh else 'adb'})")
-    rc = common.run_streaming(
-        [f"./{script}", stype], cwd=os.path.dirname(deploy), log=log)
-    if rc != 0:
-        log(f"[ERROR] FAILED (rc={rc}): {script} {target}")
-        return False
-    return True
+    return _run_deploy(os.path.dirname(deploy), script, stype, target, log)
 
 
 def flash_mcu_extracted(extracted_dir, serial, log, dry_run):
