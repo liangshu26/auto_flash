@@ -25,6 +25,7 @@ import sys
 import json
 import time
 import ssl
+import shutil
 import hashlib
 import threading
 import argparse
@@ -37,14 +38,18 @@ from concurrent.futures import ThreadPoolExecutor
 BASE_URL = "https://cicdops.xiaopeng.link/data/xpilot"
 DEFAULT_WATCH_INTERVAL = 10   # 分钟
 DEFAULT_TIMEOUT_HOURS = 24
+MAX_PARALLEL = 3              # 同时下载的文件数上限 (跨 DT / 跨直链共用)
 
-# type -> (DT 路径前缀, 默认 filter)。-f 显式给出时覆盖默认 filter。
+# type -> (DT 路径前缀, 默认 filter, 文件名白名单正则)。-f 显式给出时覆盖默认 filter。
+# ENG_DEV/ 目录下除真正可刷的大包外, 还并列着 XPU_/XPUS_/XPUMDL_/XPUSMDL_ 与
+# VLMU_EEA36_*_ULTRA.zip 等非刷机产物, 光靠路径子串会把它们全下下来 (选 xpu-big
+# 能多下十几 GB), 因此大包类型再按文件名收紧。
 TYPE_MAP = {
-    "vlmu-big":   ("DEBUG",    "VLMU/ENG_"),
-    "vlmu-small": ("DEBUG",    "VLMU/vlmu_xpilot_release"),
-    "xpu-big":    ("DEBUG",    "XPU/ENG_"),
-    "xpu-small":  ("DEBUG",    "XPU/xpilot_release_full"),
-    "mcu":        ("MCUDEBUG", "XPilot_AURIX"),
+    "vlmu-big":   ("DEBUG",    "VLMU/ENG_",                r"^VLMU\d"),
+    "vlmu-small": ("DEBUG",    "VLMU/vlmu_xpilot_release", ""),
+    "xpu-big":    ("DEBUG",    "XPU/ENG_",                 r"^XCCP"),
+    "xpu-small":  ("DEBUG",    "XPU/xpilot_release_full",  ""),
+    "mcu":        ("MCUDEBUG", "XPilot_AURIX",             ""),
 }
 
 # ---------------------------------------------------------------- 日志 / 颜色
@@ -142,12 +147,17 @@ def dt_path(platform, prefix, dt):
     return f"images/DEBUG/{platform}/{prefix}-{dt}/"
 
 
-def find_files(path, filter_str="", log=default_log):
+def find_files(path, filter_str="", log=default_log, name_re=""):
     """递归列出 path 下匹配 filter 的文件, 返回 [(key, size), ...]。
 
     跳过 .md5; filter 为大小写不敏感的子串匹配 (空则不过滤)。
+    name_re 非空时再按文件名做正则匹配 (大小写敏感), 用于排除路径子串命中
+    但并非刷机产物的文件 (如 XPU_/XPUS_/XPUMDL_/XPUSMDL_); 被排除的会汇总
+    打一条日志, 便于命名变化时及时发现白名单失效。
     """
     results = []
+    skipped = set()
+    rx = re.compile(name_re) if name_re else None
 
     def rec(p):
         try:
@@ -163,10 +173,38 @@ def find_files(path, filter_str="", log=default_log):
                 continue
             if filter_str and filter_str.lower() not in key.lower():
                 continue
+            name = os.path.basename(key)
+            if rx and not rx.search(name):
+                skipped.add(name)
+                continue
             results.append((key, f.get("size", 0)))
 
     rec(path)
+    if skipped:
+        names = sorted(skipped)
+        shown = ", ".join(names[:3]) + (" ..." if len(names) > 3 else "")
+        log(f"[INFO] 已跳过 {len(names)} 个同目录下的非刷机产物: {shown}")
     return results
+
+
+def _disk_ok(dest_dir, need, log, filename):
+    """下载前检查磁盘空间是否够 (need 为还需写入的字节数)。
+
+    空间不足时直接失败, 否则几个 GB 的包会写到一半报错、再重试 5 次同样失败。
+    拿不到磁盘信息时放行 (只 WARN), 不因探测失败阻断下载。
+    """
+    if need <= 0:
+        return True
+    try:
+        free = shutil.disk_usage(dest_dir).free
+    except OSError as e:
+        log(f"[WARN] 无法检查磁盘空间: {e}")
+        return True
+    if free < need:
+        log(f"[ERROR] 磁盘空间不足: {filename} 还需 {format_size(need)}, "
+            f"可用 {format_size(free)} ({dest_dir})")
+        return False
+    return True
 
 
 def _download_once(key, dest_dir, log=default_log, timeout=30, cancel_cb=None, pause_cb=None, progress_cb=None):
@@ -235,6 +273,11 @@ def _download_once(key, dest_dir, log=default_log, timeout=30, cancel_cb=None, p
             existing = 0
         total = (existing + clen) if (resume and clen) else clen
         mode = "ab" if resume else "wb"
+        # 磁盘空间预检: 续传只需剩余部分; 从头下 (wb) 会截断已有文件, 按全量算
+        have = existing if mode == "ab" else 0
+        if not _disk_ok(dest_dir, max(0, (server_size or total or 0) - have),
+                        log, filename):
+            return False
         written = existing
         start_time = time.time()
         last_log_pct = -1
@@ -296,6 +339,10 @@ def _download_once(key, dest_dir, log=default_log, timeout=30, cancel_cb=None, p
     # 下载完成后校验完整性: 优先用 HEAD 得到的 server_size, 退化用 Content-Length 推算的 total
     expected = server_size or (total or 0)
     final_size = os.path.getsize(dest) if os.path.exists(dest) else 0
+    if not expected:
+        # 服务器既没给 HEAD Content-Length 也没给 GET Content-Length:
+        # 截断的文件在大小检查这一关看不出来, 只能靠后续 MD5 兜底
+        log(f"[WARN] 服务器未提供文件大小, 无法核对完整性 (仅靠 MD5 兜底): {filename}")
     if expected and final_size < expected:
         # 连接中断导致没下完 (不是损坏): 上层会带 Range 续传重试
         log(f"[WARN] 下载不完整 ({format_size(final_size)}/{format_size(expected)}), "
@@ -328,22 +375,32 @@ def _file_md5(path, chunk=1 << 20):
     return h.hexdigest()
 
 
-def check_md5(key, path, log=default_log, timeout=30):
-    """下载后与服务器上的 <url>.md5 校验。服务器无 .md5 或格式不识别时跳过 (返回 True)。"""
+def check_md5(key, path, log=default_log, timeout=30, unverified_out=None):
+    """下载后与服务器上的 <url>.md5 校验。服务器无 .md5 或格式不识别时跳过 (返回 True)。
+
+    unverified_out: 可选 list, 跳过校验时把文件名追加进去, 供调用方在结尾汇总
+    提醒 —— 直链下载的包常常没有 .md5, 逐条 WARN 容易被刷过去。
+    """
+    name = os.path.basename(path)
+
+    def _skip(msg):
+        log(f"[WARN] {msg}: {name}")
+        if unverified_out is not None:
+            unverified_out.append(name)
+        return True
+
     url = _resolve_url(key) + ".md5"
     req = urllib.request.Request(url, headers={"User-Agent": "xp5-downloader/1.0"})
     try:
         with _urlopen(req, timeout) as r:
             content = r.read().decode("utf-8", "replace")
     except Exception:  # noqa
-        log(f"[WARN] 服务器无 .md5, 跳过校验: {os.path.basename(path)}")
-        return True
+        return _skip("服务器无 .md5, 跳过校验")
     m = _MD5_RE.search(content)
     if not m:
-        log(f"[WARN] .md5 内容无法解析, 跳过校验: {os.path.basename(path)}")
-        return True
+        return _skip(".md5 内容无法解析, 跳过校验")
     expect = m.group(0).lower()
-    log(f"[INFO] 校验 MD5: {os.path.basename(path)} ...")
+    log(f"[INFO] 校验 MD5: {name} ...")
     try:
         actual = _file_md5(path)
     except OSError as e:
@@ -352,16 +409,18 @@ def check_md5(key, path, log=default_log, timeout=30):
     if actual != expect:
         log(f"[ERROR] MD5 不匹配: 期望 {expect}, 实际 {actual}")
         return False
-    log(f"[OK] MD5 校验通过: {os.path.basename(path)}")
+    log(f"[OK] MD5 校验通过: {name}")
     return True
 
 
 def download_file(key, dest_dir, log=default_log, timeout=30, cancel_cb=None,
-                  pause_cb=None, progress_cb=None, retries=5, verify=True):
+                  pause_cb=None, progress_cb=None, retries=5, verify=True,
+                  unverified_out=None):
     """下载单个文件 (含失败自动重试 + MD5 校验)。成功返回 True。
 
     网络类失败 (含连接中断/卡死超时) 自动重试并带 Range 续传, 不从头下;
     MD5 不匹配则删除文件重下。timeout 为 socket 读超时, 见 _download_once。
+    unverified_out: 可选 list, 收集未做完整性校验的文件名, 见 check_md5。
     """
     filename = _filename_of(_resolve_url(key))
     for attempt in range(1, retries + 1):
@@ -374,8 +433,11 @@ def download_file(key, dest_dir, log=default_log, timeout=30, cancel_cb=None,
             return False
         if ok:
             if not verify:
+                if unverified_out is not None:
+                    unverified_out.append(filename)
                 return True
-            if check_md5(key, os.path.join(dest_dir, filename), log):
+            if check_md5(key, os.path.join(dest_dir, filename), log,
+                         unverified_out=unverified_out):
                 return True
             log(f"[ERROR] MD5 校验失败, 删除文件后重下: {filename}")
             try:
@@ -423,14 +485,19 @@ class _ProgressAgg:
 
 # ---------------------------------------------------------------- 高层流程
 def resolve_type(type_str, user_filter=""):
-    """返回 (prefix, filter)。type_str 为空则用 DEBUG 前缀 + 用户 filter。"""
+    """返回 (prefix, filter, name_re)。type_str 为空则用 DEBUG 前缀 + 用户 filter。
+
+    用户显式给出 filter 时视为"清楚自己要什么", 不再叠加文件名白名单。
+    """
     if not type_str:
-        return "DEBUG", user_filter
+        return "DEBUG", user_filter, ""
     if type_str not in TYPE_MAP:
         raise ValueError(
             f"Unknown type: {type_str} (可选 {'|'.join(TYPE_MAP)})")
-    prefix, default_filter = TYPE_MAP[type_str]
-    return prefix, (user_filter or default_filter)
+    prefix, default_filter, name_re = TYPE_MAP[type_str]
+    if user_filter:
+        return prefix, user_filter, ""
+    return prefix, default_filter, name_re
 
 
 def select_platform_interactive(log=default_log):
@@ -472,7 +539,8 @@ def _select_files_interactive(files, prefix_path, log=default_log):
     return chosen
 
 
-def _watch_poll(dt, platform, prefix, filter_str, interval_min, timeout_hrs, log, cancel_cb=None):
+def _watch_poll(dt, platform, prefix, filter_str, interval_min, timeout_hrs, log, cancel_cb=None,
+                name_re=""):
     """轮询直到 DT 目录出现且匹配到文件; 成功返回 True。"""
     start = time.time()
     timeout_sec = timeout_hrs * 3600
@@ -496,7 +564,7 @@ def _watch_poll(dt, platform, prefix, filter_str, interval_min, timeout_hrs, log
             return False
         log(f"{datetime.now():%Y-%m-%d %H:%M:%S} [POLL #{attempt}] 检查中...")
         try:
-            found = find_files(path, filter_str, log)
+            found = find_files(path, filter_str, log, name_re)
         except Exception:  # noqa
             found = []
         if found:
@@ -518,74 +586,121 @@ def _watch_poll(dt, platform, prefix, filter_str, interval_min, timeout_hrs, log
             slept += 2
 
 
-def download_dt(dt, platform, prefix, filter_str, dest_dir,
-                all_=True, list_only=False, log=default_log,
-                watch=0, timeout_hrs=DEFAULT_TIMEOUT_HOURS, cancel_cb=None,
-                pause_cb=None, progress_cb=None):
-    """处理单个 DT: 扫描 -> 列出 -> (下载)。成功返回 True。
+def _select_dt_files(dt, platform, prefix, filter_str, name_re,
+                     all_=True, list_only=False, log=default_log, first_only=False):
+    """扫描单个 DT 并选出要下的文件, 返回 [(key, size), ...]。
 
-    mcu 类型由调用方把 filter_str 设为 'MCUDEBUG-<dt>.zip' (见 run_download)。
-    cancel_cb: 可选, 无参函数, 返回 True 表示应取消下载。
-    pause_cb: 可选, 无参函数, 返回 True 表示应暂停下载。
-    progress_cb: 可选, 函数签名 (written, total, speed, eta_str), 用于实时更新进度。
+    没找到任何文件返回 None (调用方计入失败); list_only 打印清单后返回 []。
+    first_only: 轮询模式下只取第一个文件 (仅 all_=False 时生效, 与原语义一致)。
     """
-    watch_first = False
-    if watch > 0:
-        if not _watch_poll(dt, platform, prefix, filter_str, watch, timeout_hrs, log, cancel_cb):
-            return False
-        watch_first = True
-
     path = dt_path(platform, prefix, dt)
     log(f"[INFO] 扫描 {prefix}-{dt} (车型 {platform}) 的文件...")
-    files = find_files(path, filter_str, log)
+    files = find_files(path, filter_str, log, name_re)
     if not files:
         log(f"[ERROR] DT {dt} / 车型 {platform} 没找到文件, 请核对 DT 号与车型。")
-        return False
+        return None
 
     if list_only:
         for i, (key, size) in enumerate(files, 1):
             rel = key[len(path):] if key.startswith(path) else os.path.basename(key)
             sz = f"({format_size(size)})" if size else ""
             print(f"  {i:2d}. {rel} {sz}")
-        return True
+        return []
 
     if all_:
-        selected = [k for k, _ in files]
+        selected = files
         log(f"[OK] 将下载全部 {len(selected)} 个文件。")
-    elif watch_first:
-        selected = [files[0][0]]
-        log(f"[OK] Watch 模式: 只下载第一个文件 {os.path.basename(selected[0])}")
+    elif first_only and files:
+        selected = files[:1]
+        log(f"[OK] Watch 模式: 只下载第一个文件 {os.path.basename(selected[0][0])}")
     else:
-        selected = _select_files_interactive(files, path, log)
+        chosen = _select_files_interactive(files, path, log)
+        by_key = dict(files)
+        selected = [(k, by_key[k]) for k in chosen if k in by_key]
 
     if not selected:
         log(f"[WARN] DT {dt} 未选择任何文件。")
+    return selected
+
+
+def _download_pool(keys, dest_dir, log, cancel_cb=None, pause_cb=None,
+                   progress_cb=None, unverified_out=None, header_fn=None):
+    """并发下载一批文件/链接 (最多 MAX_PARALLEL 个), 聚合进度。返回失败数。
+
+    只有一个文件时直接下, 不开线程池。header_fn(key) 可选, 在每个文件开始前打
+    一条标题日志 (直链用它标明来源)。并发时各文件日志会交错, 属预期。
+    """
+    if not keys:
+        return 0
+
+    def one(k, cb):
+        if cancel_cb and cancel_cb():
+            return False
+        if header_fn:
+            log(header_fn(k))
+        return download_file(k, dest_dir, log=log, cancel_cb=cancel_cb,
+                             pause_cb=pause_cb, progress_cb=cb,
+                             unverified_out=unverified_out)
+
+    if len(keys) == 1:
+        if cancel_cb and cancel_cb():
+            log("[WARN] 下载已取消")
+            return 1
+        return 0 if one(keys[0], progress_cb) else 1
+
+    agg = _ProgressAgg(progress_cb) if progress_cb else None
+
+    def worker(k):
+        cb = (lambda w, t, s, e, kk=k: agg.update(kk, w, t)) if agg else None
+        return one(k, cb)
+
+    fail = 0
+    with ThreadPoolExecutor(max_workers=min(MAX_PARALLEL, len(keys))) as ex:
+        for res in ex.map(worker, keys):
+            if not res:
+                fail += 1
+    return fail
+
+
+def download_dt(dt, platform, prefix, filter_str, dest_dir,
+                all_=True, list_only=False, log=default_log,
+                watch=0, timeout_hrs=DEFAULT_TIMEOUT_HOURS, cancel_cb=None,
+                pause_cb=None, progress_cb=None, name_re="", unverified_out=None):
+    """处理单个 DT: 扫描 -> 列出 -> (下载)。成功返回 True。
+
+    mcu 类型由调用方把 filter_str 设为 'MCUDEBUG-<dt>.zip' (见 run_download)。
+    cancel_cb: 可选, 无参函数, 返回 True 表示应取消下载。
+    pause_cb: 可选, 无参函数, 返回 True 表示应暂停下载。
+    progress_cb: 可选, 函数签名 (written, total, speed, eta_str), 用于实时更新进度。
+    name_re: 可选, 文件名白名单正则, 见 find_files。
+    unverified_out: 可选 list, 收集未校验的文件名, 见 check_md5。
+    """
+    watch_first = False
+    if watch > 0:
+        if not _watch_poll(dt, platform, prefix, filter_str, watch, timeout_hrs, log,
+                           cancel_cb, name_re):
+            return False
+        watch_first = True
+
+    selected = _select_dt_files(dt, platform, prefix, filter_str, name_re,
+                                all_=all_, list_only=list_only, log=log,
+                                first_only=watch_first)
+    if selected is None:
+        return False
+    if not selected:
         return True
 
     log(f"[INFO] 将下载 {len(selected)} 个文件到: {dest_dir}\n")
-    if len(selected) == 1:
-        key = selected[0]
-        if cancel_cb and cancel_cb():
-            log("[WARN] 下载已取消")
-            return False
-        return download_file(key, dest_dir, log=log, cancel_cb=cancel_cb,
-                             pause_cb=pause_cb, progress_cb=progress_cb)
+    return _download_pool([k for k, _ in selected], dest_dir, log, cancel_cb,
+                          pause_cb, progress_cb, unverified_out) == 0
 
-    # 多文件: 最多 3 个并发 (跨文件并发不拖慢单文件, 总耗时更短)
-    agg = _ProgressAgg(progress_cb) if progress_cb else None
 
-    def one(k):
-        if cancel_cb and cancel_cb():
-            return False
-        cb = (lambda w, t, s, e, kk=k: agg.update(kk, w, t)) if agg else None
-        return download_file(k, dest_dir, log=log, cancel_cb=cancel_cb,
-                             pause_cb=pause_cb, progress_cb=cb)
-
-    ok = True
-    with ThreadPoolExecutor(max_workers=min(3, len(selected))) as ex:
-        for res in ex.map(one, selected):
-            ok = ok and res
-    return ok
+def _log_unverified(unverified, log):
+    """结尾汇总未做完整性校验的文件 (服务器无 .md5), 避免逐条 WARN 被刷过去。"""
+    names = sorted(set(unverified or []))
+    if names:
+        log(f"[WARN] 以下 {len(names)} 个文件未做完整性校验 (服务器无 .md5), "
+            f"刷机前请自行确认: {', '.join(names)}")
 
 
 def run_download(platform, tasks, dest_dir, log=default_log,
@@ -594,18 +709,25 @@ def run_download(platform, tasks, dest_dir, log=default_log,
                  pause_cb=None, progress_cb=None):
     """批量下载。tasks=[(type_str, dt_string), ...]; dt_string 可含多个空格分隔 DT。
 
-    返回失败的 DT 任务数 (0 表示全成功)。
+    返回失败数 (0 表示全成功)。
+    非轮询模式: 先串行扫完所有 DT (只是目录请求, 很快), 再把全部文件汇总进同一个
+    并发池下载 (最多 MAX_PARALLEL 个) —— 跨 DT 并行, 总耗时接近除以并发数。
+    轮询模式 (watch>0): 语义就是逐个 DT 等出包再下, 保持串行。
     cancel_cb: 可选, 无参函数, 返回 True 表示应取消下载。
     pause_cb: 可选, 无参函数, 返回 True 表示应暂停下载。
     progress_cb: 可选, 函数签名 (written, total, speed, eta_str), 用于实时更新进度。
     """
     fail = 0
+    unverified = []
+    plan = []                      # [(key, size, dt, type_str)]
+
     for type_str, dt_string in tasks:
         if cancel_cb and cancel_cb():
             log("[WARN] 下载已取消")
+            _log_unverified(unverified, log)
             return fail + 1
         try:
-            prefix, filt = resolve_type(type_str, user_filter)
+            prefix, filt, name_re = resolve_type(type_str, user_filter)
         except ValueError as e:
             log(f"[ERROR] {e}")
             fail += 1
@@ -613,17 +735,44 @@ def run_download(platform, tasks, dest_dir, log=default_log,
         for dt in dt_string.split():
             if cancel_cb and cancel_cb():
                 log("[WARN] 下载已取消")
+                _log_unverified(unverified, log)
                 return fail + 1
             log(f"\n[INFO] ==== 处理 DT {dt} (type={type_str or '-'}) ====")
             # mcu: 只匹配该 DT 的顶层 zip, 跳过散装 .hex
-            if type_str == "mcu":
-                filt = f"MCUDEBUG-{dt}.zip"
-            if not download_dt(dt, platform, prefix, filt, dest_dir,
-                               all_=all_, list_only=list_only, log=log,
-                               watch=watch, timeout_hrs=timeout_hrs,
-                               cancel_cb=cancel_cb, pause_cb=pause_cb,
-                               progress_cb=progress_cb):
+            dt_filt = f"MCUDEBUG-{dt}.zip" if type_str == "mcu" else filt
+            if watch > 0:
+                # 轮询: 逐个 DT 等出包并立即下载, 不进并发池
+                if not download_dt(dt, platform, prefix, dt_filt, dest_dir,
+                                   all_=all_, list_only=list_only, log=log,
+                                   watch=watch, timeout_hrs=timeout_hrs,
+                                   cancel_cb=cancel_cb, pause_cb=pause_cb,
+                                   progress_cb=progress_cb, name_re=name_re,
+                                   unverified_out=unverified):
+                    fail += 1
+                continue
+            selected = _select_dt_files(dt, platform, prefix, dt_filt, name_re,
+                                        all_=all_, list_only=list_only, log=log)
+            if selected is None:
                 fail += 1
+            else:
+                plan.extend((k, s, dt, type_str) for k, s in selected)
+
+    if watch > 0:
+        _log_unverified(unverified, log)
+        return fail
+
+    if plan:
+        total_size = sum(s for _, s, _, _ in plan)
+        log(f"\n[INFO] ==== 开始下载 {len(plan)} 个文件 (共 {format_size(total_size)}, "
+            f"最多 {MAX_PARALLEL} 个并发) ====")
+        for k, s, dt, typ in plan:
+            log(f"[INFO]   {os.path.basename(k)} ({format_size(s)})  <- DT {dt}"
+                + (f" {typ}" if typ else ""))
+        log("")
+        fail += _download_pool([k for k, _, _, _ in plan], dest_dir, log,
+                               cancel_cb, pause_cb, progress_cb, unverified)
+
+    _log_unverified(unverified, log)
     return fail
 
 
@@ -643,31 +792,11 @@ def run_download_urls(urls, dest_dir, log=default_log, cancel_cb=None,
         log(f"[ERROR] 无法创建下载目录 {dest_dir}: {e}")
         return len(urls)
 
-    if len(urls) == 1:
-        u = urls[0]
-        log(f"\n[INFO] ==== 直链下载: {_filename_of(u)} ====")
-        if cancel_cb and cancel_cb():
-            log("[WARN] 下载已取消")
-            return 1
-        return 0 if download_file(u, dest_dir, log=log, cancel_cb=cancel_cb,
-                                  pause_cb=pause_cb, progress_cb=progress_cb) else 1
-
-    # 多链接: 最多 3 个并发, 聚合进度
-    agg = _ProgressAgg(progress_cb) if progress_cb else None
-
-    def one(u):
-        if cancel_cb and cancel_cb():
-            return False
-        log(f"\n[INFO] ==== 直链下载: {_filename_of(u)} ====")
-        cb = (lambda w, t, s, e, uu=u: agg.update(uu, w, t)) if agg else None
-        return download_file(u, dest_dir, log=log, cancel_cb=cancel_cb,
-                             pause_cb=pause_cb, progress_cb=cb)
-
-    fail = 0
-    with ThreadPoolExecutor(max_workers=min(3, len(urls))) as ex:
-        for res in ex.map(one, urls):
-            if not res:
-                fail += 1
+    unverified = []
+    fail = _download_pool(
+        urls, dest_dir, log, cancel_cb, pause_cb, progress_cb, unverified,
+        header_fn=lambda u: f"\n[INFO] ==== 直链下载: {_filename_of(u)} ====")
+    _log_unverified(unverified, log)
     return fail
 
 
