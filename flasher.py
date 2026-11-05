@@ -64,6 +64,17 @@ DEPLOY_FAIL_MARKERS = (
 
 ALL_ORDER = ("vlmu", "xp5_a", "xp5_b", "mcu")
 
+# 大包重试: adc_flashall.sh 里的 auto_fastboot_by_usb_id.sh 只给 60s 等板子进
+# fastboot, 超时就直接 rc=1 退出 (日志表现: 有 "waiting for device to enter
+# fastboot mode" 却始终没有 "board_type:" 那一行)。此时还没有任何分区被写入,
+# 重跑是安全的; 一旦开始写就绝不重试。
+BIG_RETRIES = 3
+BIG_RETRY_DELAY = 15
+# 进 fastboot 阶段 (还没开始刷) 的标志
+BIG_WAIT_MARKER = "waiting for device to enter fastboot mode"
+# 已经开始写分区的标志 —— 命中任一条就不允许重试
+BIG_WRITE_MARKERS = ("fastboot_flashall at", "Sending '", "Flashing ", "Writing ")
+
 
 # ---------------------------------------------------------------- 解压
 def _work_dir_for(pkg, work_root):
@@ -257,6 +268,59 @@ def _big_pkg_platform_ok(log):
     return True
 
 
+def _back_to_adb(serial, log, timeout=90):
+    """板子若卡在 fastboot, 先重启回系统。
+
+    adc_flashall.sh 开头要靠 `adb devices` 认出板子 (A/B/C) 才能决定刷哪个
+    ufs_images 目录, 设备留在 fastboot 里它就直接找不到设备, 重试必然再失败。
+    """
+    if serial not in common.fastboot_devices():
+        return
+    log(f"[INFO] {serial} 仍在 fastboot 模式, 先重启回系统...")
+    common.run_streaming(["fastboot", "-s", serial, "reboot"], log=log)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if serial in common.adb_devices():
+            log(f"[INFO] {serial} 已回到 adb")
+            return
+        time.sleep(5)
+    log(f"[WARN] {serial} 在 {timeout}s 内未回到 adb, 仍然重试一次")
+
+
+def _run_flashall(flashall, serial, target, log):
+    """跑 adc_flashall.sh, 失败时最多重试 BIG_RETRIES 次。
+
+    只在"设备没进 fastboot 就超时"这一种失败上重试: 判据是输出里出现了等待
+    fastboot 的那一行, 且没有任何一条写分区的标记。这样能保证重试都发生在
+    还没动过板子的时候, 不会把刷到一半的包重刷一遍。
+    """
+    script_dir = os.path.dirname(flashall)
+    markers = (BIG_WAIT_MARKER,) + BIG_WRITE_MARKERS
+    for attempt in range(BIG_RETRIES + 1):
+        if attempt:
+            log(f"[WARN] {BIG_RETRY_DELAY}s 后重试 adc_flashall.sh {target} "
+                f"(第 {attempt}/{BIG_RETRIES} 次)...")
+            time.sleep(BIG_RETRY_DELAY)
+            _back_to_adb(serial, log)
+        rc, seen = common.run_streaming_marks(
+            ["./adc_flashall.sh", serial], cwd=script_dir, log=log, markers=markers)
+        if rc == 0:
+            return True
+        if seen & set(BIG_WRITE_MARKERS):
+            log(f"[ERROR] FAILED (rc={rc}): adc_flashall.sh {target} "
+                f"(已开始写入分区, 不重试)")
+            return False
+        if BIG_WAIT_MARKER not in seen:
+            log(f"[ERROR] FAILED (rc={rc}): adc_flashall.sh {target} "
+                f"(非 fastboot 超时, 不重试)")
+            return False
+        log(f"[WARN] adc_flashall.sh {target} 退出码 {rc}: "
+            f"设备未进入 fastboot, 尚未写入任何分区")
+    log(f"[ERROR] FAILED: adc_flashall.sh {target} "
+        f"重试 {BIG_RETRIES} 次后设备仍进不去 fastboot")
+    return False
+
+
 def flash_big(target, pkg, serial, work_root, log, dry_run):
     work = _work_dir_for(pkg, work_root)
     if dry_run:
@@ -276,12 +340,7 @@ def flash_big(target, pkg, serial, work_root, log, dry_run):
         return False
     _chmod_x(flashall)
     log(f"[INFO] Flash BIG {target} via adc_flashall.sh (serial={serial})")
-    rc = common.run_streaming(
-        ["./adc_flashall.sh", serial], cwd=os.path.dirname(flashall), log=log)
-    if rc != 0:
-        log(f"[ERROR] FAILED (rc={rc}): adc_flashall.sh {target}")
-        return False
-    return True
+    return _run_flashall(flashall, serial, target, log)
 
 
 def _run_deploy(script_dir, script, stype, target, log):
@@ -354,12 +413,7 @@ def flash_big_extracted(target, extracted_dir, serial, log, dry_run):
         return False
     _chmod_x(flashall)
     log(f"[INFO] Flash BIG {target} via adc_flashall.sh (serial={serial})")
-    rc = common.run_streaming(
-        ["./adc_flashall.sh", serial], cwd=os.path.dirname(flashall), log=log)
-    if rc != 0:
-        log(f"[ERROR] FAILED (rc={rc}): adc_flashall.sh {target}")
-        return False
-    return True
+    return _run_flashall(flashall, serial, target, log)
 
 
 def flash_small_extracted(target, extracted_dir, log, dry_run, use_ssh=False):

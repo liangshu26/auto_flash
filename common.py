@@ -543,3 +543,21 @@ def run_streaming_checked(argv, cwd=None, log=print, fail_markers=(), env=None):
 
     rc = run_streaming(argv, cwd=cwd, log=_log, env=env)
     return rc, (hits[0] if hits else "")
+
+
+def run_streaming_marks(argv, cwd=None, log=print, markers=(), env=None):
+    """同 run_streaming, 但收集输出里命中过的全部标记, 返回 (rc, set)。
+
+    与 run_streaming_checked 的区别: 不在第一次命中后停下, 因此可以表达
+    "看到了 X 但没看到 Y" 这类判据 (例如进了 fastboot 等待阶段却没开始写分区)。
+    """
+    seen = set()
+
+    def _log(line):
+        for m in markers:
+            if m not in seen and m in line:
+                seen.add(m)
+        log(line)
+
+    rc = run_streaming(argv, cwd=cwd, log=_log, env=env)
+    return rc, seen
