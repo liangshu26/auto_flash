@@ -25,6 +25,7 @@ import sys
 import json
 import time
 import ssl
+import random
 import shutil
 import hashlib
 import threading
@@ -38,7 +39,15 @@ from concurrent.futures import ThreadPoolExecutor
 BASE_URL = "https://cicdops.xiaopeng.link/data/xpilot"
 DEFAULT_WATCH_INTERVAL = 10   # 分钟
 DEFAULT_TIMEOUT_HOURS = 24
-MAX_PARALLEL = 3              # 同时下载的文件数上限 (跨 DT / 跨直链共用)
+# 站点限制单个 IP 的并发下载连接数为 4。每个文件除 GET 主连接外还有 HEAD 探大小
+# 和下载后的 .md5 校验两条短连接, 3 个 worker 撞上重试时会瞬时叠到 4 条以上, 故取 2。
+MAX_PARALLEL = 2              # 同时下载的文件数上限 (跨 DT / 跨直链共用)
+
+RETRY_DELAY = 3               # 普通网络失败的固定重试间隔 (秒)
+# 被限流 (429) 或服务端过载 (503) 时改用指数退避: 继续按 3 秒的节奏以同样并发撞
+# 上去只会让限流持续得更久, 这正是站点公告要求避免的行为。
+THROTTLE_STATUS = (429, 503)
+THROTTLE_BASE = 10            # 首次退避秒数, 之后翻倍 (retries=5 时最长 80s)
 
 # type -> (DT 路径前缀, 默认 filter, 文件名白名单正则)。-f 显式给出时覆盖默认 filter。
 # ENG_DEV/ 目录下除真正可刷的大包外, 还并列着 XPU_/XPUS_/XPUMDL_/XPUSMDL_ 与
@@ -207,7 +216,36 @@ def _disk_ok(dest_dir, need, log, filename):
     return True
 
 
-def _download_once(key, dest_dir, log=default_log, timeout=30, cancel_cb=None, pause_cb=None, progress_cb=None):
+def _sleep_cancellable(sec, cancel_cb):
+    """分片 sleep, 每 2 秒检查一次取消 (退避可能长达一分多钟, 不能一觉睡死)。"""
+    slept = 0.0
+    while slept < sec:
+        if cancel_cb and cancel_cb():
+            return True
+        step = min(2.0, sec - slept)
+        time.sleep(step)
+        slept += step
+    return bool(cancel_cb and cancel_cb())
+
+
+def _throttle_delay(err, throttled):
+    """被限流时该等多久 (秒)。
+
+    服务器给了 Retry-After 就照办 (它知道自己什么时候放行); 否则按指数退避。
+    退避要加抖动: 并发池里几个文件同时吃到 429 时, 固定时长会让它们再次同时发起
+    请求, 等于把限流状态一直续下去。
+    """
+    retry_after = ""
+    if err is not None and err.headers:
+        retry_after = (err.headers.get("Retry-After") or "").strip()
+    if retry_after.isdigit():
+        return float(retry_after)
+    wait = THROTTLE_BASE * (2 ** (throttled - 1))
+    return wait * random.uniform(0.9, 1.1)
+
+
+def _download_once(key, dest_dir, log=default_log, timeout=30, cancel_cb=None, pause_cb=None, progress_cb=None,
+                   http_err_out=None):
     """下载单个文件到 dest_dir, 支持断点续传 (Range)。成功返回 True。
 
     timeout 是 socket 读超时 (秒): 连接卡死时最多等这么久就中断, 交由上层续传重试,
@@ -216,6 +254,8 @@ def _download_once(key, dest_dir, log=default_log, timeout=30, cancel_cb=None, p
     cancel_cb: 可选, 无参函数, 返回 True 表示应取消下载。
     pause_cb: 可选, 无参函数, 返回 True 表示应暂停下载。
     progress_cb: 可选, 函数签名 (written, total, speed, eta_str), 用于实时更新进度。
+    http_err_out: 可选 list, 建连阶段收到 HTTP 错误时把 HTTPError 追加进去, 供上层
+                  区分"被限流"和普通网络失败 (见 download_file 的退避逻辑)。
     """
     filename = _filename_of(_resolve_url(key))
     dest = os.path.join(dest_dir, filename)
@@ -259,6 +299,11 @@ def _download_once(key, dest_dir, log=default_log, timeout=30, cancel_cb=None, p
     req = urllib.request.Request(url, headers=headers)
     try:
         r = _urlopen(req, timeout)
+    except urllib.error.HTTPError as e:
+        if http_err_out is not None:
+            http_err_out.append(e)
+        log(f"[ERROR] 下载失败 {filename}: HTTP {e.code} {e.reason}")
+        return False
     except Exception as e:  # noqa
         log(f"[ERROR] 下载失败 {filename}: {e}")
         return False
@@ -419,16 +464,19 @@ def download_file(key, dest_dir, log=default_log, timeout=30, cancel_cb=None,
     """下载单个文件 (含失败自动重试 + MD5 校验)。成功返回 True。
 
     网络类失败 (含连接中断/卡死超时) 自动重试并带 Range 续传, 不从头下;
+    被限流 (HTTP 429/503) 时改用指数退避而不是固定间隔, 见 _throttle_delay;
     MD5 不匹配则删除文件重下。timeout 为 socket 读超时, 见 _download_once。
     unverified_out: 可选 list, 收集未做完整性校验的文件名, 见 check_md5。
     """
     filename = _filename_of(_resolve_url(key))
+    throttled = 0                       # 累计吃限流的次数, 只用来算退避时长
     for attempt in range(1, retries + 1):
         if cancel_cb and cancel_cb():
             return False
+        http_err = []
         ok = _download_once(key, dest_dir, log=log, timeout=timeout,
                             cancel_cb=cancel_cb, pause_cb=pause_cb,
-                            progress_cb=progress_cb)
+                            progress_cb=progress_cb, http_err_out=http_err)
         if cancel_cb and cancel_cb():
             return False
         if ok:
@@ -446,8 +494,19 @@ def download_file(key, dest_dir, log=default_log, timeout=30, cancel_cb=None,
                 pass
             ok = False
         if attempt < retries:
-            log(f"[WARN] {filename} 第 {attempt}/{retries} 次尝试失败, 3 秒后重试")
-            time.sleep(3)
+            err = http_err[0] if http_err else None
+            if getattr(err, "code", 0) in THROTTLE_STATUS:
+                throttled += 1
+                wait = _throttle_delay(err, throttled)
+                log(f"[WARN] {filename} 被限流 (HTTP {err.code}), "
+                    f"{wait:.0f} 秒后重试 (第 {attempt}/{retries} 次)")
+            else:
+                wait = RETRY_DELAY
+                log(f"[WARN] {filename} 第 {attempt}/{retries} 次尝试失败, "
+                    f"{RETRY_DELAY} 秒后重试")
+            if _sleep_cancellable(wait, cancel_cb):
+                log(f"[WARN] 下载已取消: {filename}")
+                return False
     log(f"[ERROR] 下载失败 (已重试 {retries} 次): {filename}")
     return False
 
