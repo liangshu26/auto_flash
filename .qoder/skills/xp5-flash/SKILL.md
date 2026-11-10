@@ -13,13 +13,18 @@ VLMU MCU (OTA 升级)。四类的设备接入方式限制各不相同，选错�
 
 ## 1. 设备拓扑
 
-| ChipMode | 刷机目标 | board-type | 实测 board-id | ssh IP (免密 root) |
-|---|---|---|---|---|
-| `SoC_A` | `xp5_a` | A | `0x0000000c` | 172.20.1.22 |
-| `SoC_B` | `xp5_b` | B | `0x00000014` | 172.20.1.30 |
-| `SoC_VLMU` | `vlmu` | C | — | 172.20.1.119 |
+| ChipMode | 刷机目标 | board-type | ssh IP (免密 root) |
+|---|---|---|---|
+| `SoC_A` | `xp5_a` | A | 172.20.1.22 |
+| `SoC_B` | `xp5_b` | B | 172.20.1.30 |
+| `SoC_VLMU` | `vlmu` | C | 172.20.1.119 |
 
 `board-type` D = fpu，没有刷机目标。
+
+`board-id`（大包日志里的 `vehicle_did` / `Detected board-id`）是**每块板各自的**，
+不能拿来判板型：实测 board-type A 出现过 `0x00000003` / `0x0000000c` / `0x00000012`，
+B 出现过 `0x0000000a` / `0x00000014`，C 出现过 `0x00000010` / `0x00000011`。
+VLMU (C) 的大包日志不打 `Detected board-id` 那一行。
 
 识别命令：
 
@@ -104,12 +109,25 @@ chmod +x adc_flashall.sh
 脚本自带完整流程，**不需要手动进 fastboot**：
 
 1. `lcs: DM` 安全检查 → `Flash allowed.`
-2. `auto_fastboot_by_usb_id.sh` 把板子推进 fastboot 模式
+2. `auto_fastboot_by_usb_id.sh` 把板子推进 fastboot 模式，成功时会打
+   `board_type: <A|B|C> vehicle_did: 0x........`（`vehicle_did` 每块板不同）
 3. `fastboot getvar board-type` / `board-did` 自动判板型
 4. `fastboot_flashall`：norflash 分区 slot a + slot b，再 ufs 分区 slot a + slot b（`--slot all`）
-5. `adc_flash_lu1`：`product.img`（product_a/product_b），再 `xpilot.img` ——
-   **按板型自动选 `../ufs_images/xp5A` 或 `xp5B`**，35 个 sparse 分片 × 双 slot
+5. `adc_flash_lu1`：`product.img`（product_a/product_b），再按板型自动选镜像目录刷
+   `xpilot.img`（`xp5A` / `xp5B` / `xp5C`）
 6. `Rebooting` → `Waiting 20s for device to boot...` → 检查 `/xdata/config/.no_auto_launch`
+
+xpilot 之后还会刷什么，取决于板型和包变体：
+
+| 板 / 包 | 额外分区 | 镜像 | 目录 | 分片数 |
+|---|---|---|---|---|
+| A（`_xai` 包） | `maps` | `xai.img` | `../ufs_images/xp5A` | 15（仅 slot a） |
+| B（`_xai` 包） | `xai` | `xai.img` | `../ufs_images/xp5B` | 67（仅 slot a） |
+| C / VLMU | `xdata` | `xdata.img` | `../ufs_images/xp5C` | 93（仅 slot a） |
+
+`xpilot.img` 本身的分片数也按板型不同：XCCP (A/B) **35** × 双 slot，VLMU (C) **13** × 双 slot。
+包名以 `_xai` 结尾的才带 `xai.img`；同一个 `xai.img` 在 A 上刷进 `maps` 分区、在 B 上刷进
+`xai` 分区（**分区名不一样**，且 A/B 两个目录里的 `xai.img` 内容和 md5 也不同）。
 
 成功标志：
 
@@ -120,9 +138,21 @@ total time statistics: <N> s
 flash all done and fastboot continue at <timestamp>
 ```
 
+失败但**可以安全重跑**的一种：进 fastboot 超时。日志停在
+
+```
+waiting for device to enter fastboot mode... at <timestamp>
+timeout 60s ./platform-tools/linux/fastboot -s <serial> getvar board-type
+```
+
+始终没有 `board_type:` 那一行（成功时约 10~12s 就会出现）。包内脚本只给 60s，超时即 rc=1
+退出。此时**还没有任何分区被写入**（没有 `fastboot_flashall at`、没有 `Sending`/`Flashing`），
+直接重跑即可；重跑前若板子卡在 fastboot 里，先 `fastboot -s <serial> reboot` 退回 adb，
+因为脚本开头要靠 `adb devices` 认板型。
+
 前置条件：
 - 依赖包内 `platform-tools/linux/fastboot`，**只能在 Linux 上刷**。
-- `/tmp` 需有空间暂存大镜像（xpilot.img 约 5GB），刷前检查。
+- `/tmp` 会被 fastboot 用来暂存大镜像（xpilot.img 约 5GB），空间不足会卡在 `Sending sparse`。
 - 同一个 XCCP 大包 A/B 两块板通用，靠 board-type 自动区分镜像目录。
 
 ## 5. 小包 — deploy_xpilot*.sh
@@ -144,13 +174,27 @@ chmod +x deploy_xpilot_by_adb.sh
 reboot 进 no_auto_launch（等 offline 再等 online）→ `start to scp xp5 package`
 （先 `rm` 旧文件，再逐目录 `adb push`）→ `sync` → `begin reboot xpu process...`
 
+台架上接了多块板时，`kernel_dts is <X>` 会**每块候选板打一行**（例如先 `xp5_a` 再
+`xp5_vlmu`），不是错误。
+
+**VLMU (`xp5_vlmu`) 与 xp5_a/xp5_b 的差别**：
+
+- 重启动作走 `type is xp5_vlmu, reboot by aurix_utility`（xp5 板不走 aurix）
+- 推完主目录后多一步 `type is xp5_vlmu, copy libs to /xpilot/libs` → `./libs/: 6 files pushed`
+- 独有目录：`mcu_agent/`、`vlmu/`(104 files)、`vlmu_bsp_version.txt`、`vlmu_can_dds_forwarder/`
+- **没有** `rm: cannot remove ...: Permission denied` 那几十行噪声
+- 对账基准 **1675 files / 1.63 GB / 约 96~101s**（xp5 整包是 12584 files / 4.4 GB / 约 300s）
+- 结尾的 `wait device <serial> offline` 常常等不到，打
+  `Device <serial> is still online after 300 retries.` 后继续 `reboot xpu` 并正常收尾
+  —— 实测两次独立刷机都是这样且都成功，**不是失败**
+
 **ssh 版流程**：读远端 SOC / BSP / master MCU 版本并与包内 `./xpilot/bsp_version.txt`
 比对 → 校验 `xpilot/version.txt` 的 `EEA:` 字段 → `remove known_hosts` →
 逐文件 scp → md5 逐文件比对。
 
 成功标志：`===== Copying SW apps Done =====`。
 ssh 版还要求 `✅ ALL md5sum files are identical` + `compare_xpilot_md5 success`，
-且 `Files processed:` 两侧数量一致（xp5 约 12554，vlmu 约 1674）。
+且 `Files processed:` 两侧数量一致（xp5 约 12554，vlmu 约 1675）。
 `files pushed` 数量也能对账：xp5 整包约 12584 个文件 / 4.4GB，只推了 1409 个就是中途断了。
 
 版本不一致的 `[WARN]`（bsp / mcu 版本号对不上）**不是失败**，脚本会继续刷；
@@ -352,9 +396,18 @@ ERROR: xpilot/version.txt missing EEA   # 脚本自己的中止行（前缀是 x
 - `./deploy_xpilot.sh: line 639: ./xp5_status.sh: No such file or directory`
 - `sshpass is not installed, start install now` + `sudo: 需要密码` —— 脚本想装 sshpass
   但没权限；免密 ssh 可用时不影响刷机
+- `Device <serial> is still online after 300 retries.` —— VLMU 小包结尾等不到设备离线，
+  之后照常 `reboot xpu` + `===== Copying SW apps Done =====`。实测两次独立刷机都是这样
+  且都成功，**不要当失败标记**
 
 大包和 MCU 用退出码判定即可（`adc_flashall.sh` 失败会返回非 0，
 例如 `Error: auto_fastboot_by_usb_id.sh failed` → rc=1）。
+
+大包有一类失败**可以安全重跑**：进 fastboot 超时（只有
+`waiting for device to enter fastboot mode` + `timeout 60s ... getvar board-type`，
+始终没有 `board_type:` 行）。它发生在任何分区被写入之前，详见 §4。
+反过来，一旦日志里出现过 `fastboot_flashall at` / `Sending` / `Flashing`，
+就说明已经动过板子，不能盲目重跑。
 
 ## Resources
 

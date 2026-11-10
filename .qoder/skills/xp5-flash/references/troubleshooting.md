@@ -23,6 +23,41 @@ Error: auto_fastboot_by_usb_id.sh failed
 **注意连带效应：** 只要 ssh 补位成功，serial 就非空，基于"serial 为空"的等待逻辑不会触发，
 板子一秒都不等就直接判跳过或跑错脚本。接入方式过滤必须在选 serial 那一步做掉。
 
+## 大包偶发进不去 fastboot（可安全重跑）
+
+```
+Rebooting device <serial> (Board B) into fastboot mode...
+waiting for device to enter fastboot mode... at 20261105_103148
+timeout 60s ./platform-tools/linux/fastboot -s <serial> getvar board-type
+rc=1
+```
+
+判据：成功时 `waiting for device to enter fastboot mode` 之后约 **10~12 秒**就会出现
+`board_type: B vehicle_did: 0x........ at <timestamp>`；这一行始终没出现，只有包内
+`timeout 60s ... getvar board-type`，就是没进 fastboot。
+
+**这次失败发生在任何分区被写入之前**（日志里没有 `fastboot_flashall at`，也没有
+`Sending` / `Flashing` / `Writing`），所以重跑没有变砖风险。
+
+同一次任务里其它板子（C 用 10s、A 用 12s）都正常进 fastboot，而且这块板之前半小时
+一直在线闲置、不是刚被上一个任务重启完 —— 属偶发。
+
+日志本身**无法**区分三种成因，现象完全一样：
+
+1. `adb reboot fastboot` 那条命令没生效，板子一直待在正常系统里
+2. 板子进了 fastboot 但 USB 重新枚举，包内那个 `./platform-tools/linux/fastboot` 认不到
+3. 板子进了 fastboot 又自己启动出去了（部分 bootloader 在 fastboot 下无人操作会超时续 boot）
+
+要区分只能在失败瞬间同时看 `fastboot devices` 和 `adb devices`。
+
+重跑前先归位：板子若还卡在 fastboot，`adb devices` 里就没有它，而 `adc_flashall.sh`
+开头要靠 `adb devices` 列出各板板型，会直接报找不到设备。先
+`fastboot -s <serial> reboot` 并等它回到 adb，再重跑整个脚本。
+
+自动化时的重试门槛要用输出标记而不是退出码：**看到** `waiting for device to enter
+fastboot mode`、**且没看到** `fastboot_flashall at` / `Sending '` / `Flashing ` /
+`Writing ` 任一条，才允许重试。只判退出码会把刷到一半失败的情况也重刷一遍。
+
 ## ssh 刷机全部失败却报成功
 
 ```
@@ -145,4 +180,5 @@ adb -s <serial> shell "grep 'Fail!!!' /xdata/log/latest/update_service.txt.log |
 | `./deploy_xpilot_by_adb.sh: 行 131: 警告： 命令替换：忽略输入中的 null 字节` | adb 输出含 NUL |
 | `sshpass is not installed, start install now` + `sudo: 需要密码` | 免密 ssh 可用时不影响 |
 | `Warning: skip copying blackbox_a image avb footer due to sparse image.` | fastboot 对 sparse 镜像的正常提示 |
+| `Device <serial> is still online after 300 retries.` | VLMU 小包收尾等不到 adb 掉线，之后照常 `reboot xpu` + `Done`；实测两次独立刷机都这样且都成功 |
 | `[WARN] ... 版本号: X 与...不一致, 请确认是否影响` | bsp/mcu 版本比对警告，脚本会继续刷 |
