@@ -135,19 +135,6 @@ def _safe_tar_members(tf, dest, log):
     return good
 
 
-def _check_tmp_space(log, need_gb=6):
-    """fastboot 会在 /tmp 暂存大镜像 (xpilot.img 约 5GB), 刷大包前提前检查。"""
-    try:
-        free = shutil.disk_usage("/tmp").free
-    except OSError:
-        return True
-    if free < need_gb * (1 << 30):
-        log(f"[ERROR] /tmp 可用空间不足: 需要 {need_gb}GB, 当前 {free >> 30}GB")
-        log("[ERROR] fastboot 需要在 /tmp 暂存大镜像, 请清理后重试")
-        return False
-    return True
-
-
 def extract_pkg(pkg, dest, log):
     if _marker_valid(dest, pkg):
         log(f"[INFO] already extracted, reuse: {dest}")
@@ -336,8 +323,6 @@ def flash_big(target, pkg, serial, work_root, log, dry_run):
     if not flashall:
         log(f"[ERROR] flash_tools/adc_flashall.sh not found in {pkg}")
         return False
-    if not _check_tmp_space(log):
-        return False
     _chmod_x(flashall)
     log(f"[INFO] Flash BIG {target} via adc_flashall.sh (serial={serial})")
     return _run_flashall(flashall, serial, target, log)
@@ -408,8 +393,6 @@ def flash_big_extracted(target, extracted_dir, serial, log, dry_run):
     flashall = _find_file(extracted_dir, "adc_flashall.sh", path_contains="flash_tools")
     if not flashall:
         log(f"[ERROR] flash_tools/adc_flashall.sh not found in {extracted_dir}")
-        return False
-    if not _check_tmp_space(log):
         return False
     _chmod_x(flashall)
     log(f"[INFO] Flash BIG {target} via adc_flashall.sh (serial={serial})")
