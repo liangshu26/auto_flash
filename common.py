@@ -28,8 +28,6 @@ CATEGORIES = ("vlmu_big", "vlmu_small", "xp5_big", "xp5_small", "mcu", "vlmu_mcu
 
 # 清掉 adb 输出里的 C0 控制字节 (保留 \n \t), 否则正则/grep 会被 NUL 干扰
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-# 放宽匹配: 兼容 "Current ChipMode: X" / "ChipMode : X" 等格式差异
-_CHIPMODE_RE = re.compile(r"ChipMode\s*:\s*([A-Za-z0-9_]+)", re.IGNORECASE)
 
 # 最近一次 ChipMode 识别失败的原因 (供界面/日志诊断)
 last_chipmode_error = ""
@@ -61,52 +59,50 @@ def adb_devices(timeout=15):
     return serials
 
 
-# 开机途中 `adb shell version` 会先吐前半段 (PDK version / Version / Branch /
-# Built Time) 再吐 ChipMode, 读到半截就判 unknown 会让这块板从 USB 列表里消失,
-# 接着被同 IP 的 ssh 设备顶替 —— 大包任务于是拿到一个 IP 当 fastboot 序列号。
-# 所以"有 version 输出但没有 ChipMode 字段"要多等几轮; 设备根本不存在 (stderr
-# 报错) 之类的硬失败不白等。
+# 板型来源: 设备树节点 /proc/device-tree/board_config/xp_kernel_dts, 与
+# deploy_xpilot_by_adb.sh 的 check_devices() 完全一致。设备树由 bootloader/内核
+# 早期填好, 开机即可读、是定长短字符串; 不像 `adb shell version` 那样开机途中只吐
+# 前半段 (缺 ChipMode 行) 而被误判 unknown, 进而被同 IP 的 ssh 设备顶替。
+# 节点值以 NUL 结尾, strip_ctrl 会清掉。xp5_xccp-fpu 无刷机目标, 不列入映射。
+KERNEL_DTS_NODE = "/proc/device-tree/board_config/xp_kernel_dts"
+_DTS_TO_MODE = {
+    "xp5_xccp-a": "SoC_A",
+    "xp5_xccp-b": "SoC_B",
+    "xp5_xccp-vlm": "SoC_VLMU",
+}
+
 CHIPMODE_RETRIES = 3
-CHIPMODE_TRUNCATED_RETRIES = 10
-CHIPMODE_RETRY_INTERVAL = 3
+CHIPMODE_RETRY_INTERVAL = 1
 
 
 def device_chipmode(serial, timeout=15, retries=CHIPMODE_RETRIES):
     """读取某设备的 ChipMode (SoC_VLMU/SoC_A/SoC_B); 失败返回 'unknown'。
 
-    设备刚启动、adb server 被其他客户端 (版本不匹配的 adb) 重启、或系统未
-    完全起来时, `adb shell version` 会短暂失败, 因此间隔重试, 减少误报 unknown。
-    拿到半截 version 输出 (开机途中) 时按 CHIPMODE_TRUNCATED_RETRIES 延长重试。
-    最后一次失败的错误信息存入 last_chipmode_error 供界面/日志诊断。
+    读设备树节点 xp_kernel_dts (与 deploy_xpilot_by_adb.sh 一致), 不再用 version。
+    设备刚启动、adb 尚未就绪时短暂重试。最后一次失败的错误信息存入
+    last_chipmode_error 供界面/日志诊断。
     """
     global last_chipmode_error
     last_err = ""
-    budget = max(1, retries)
-    truncated = False
-    i = 0
-    while i < budget:
+    for i in range(max(1, retries)):
         if i:
-            time.sleep(CHIPMODE_RETRY_INTERVAL if truncated else 1)
-        i += 1
+            time.sleep(CHIPMODE_RETRY_INTERVAL)
         try:
             r = subprocess.run(
-                ["adb", "-s", serial, "shell", "version"],
+                ["adb", "-s", serial, "shell", f"cat {KERNEL_DTS_NODE}"],
                 capture_output=True, text=True, errors="replace",
                 timeout=timeout, stdin=subprocess.DEVNULL,
             )
         except Exception as e:  # noqa
             last_err = f"{type(e).__name__}: {e}"
             continue
-        out = strip_ctrl(r.stdout)
-        m = _CHIPMODE_RE.search(out)
-        if m:
+        dts = strip_ctrl(r.stdout).strip()
+        mode = _DTS_TO_MODE.get(dts)
+        if mode:
             last_chipmode_error = ""
-            return m.group(1)
+            return mode
         err = strip_ctrl(r.stderr or "").strip()
-        if not err and out.strip():
-            truncated = True
-            budget = max(budget, CHIPMODE_TRUNCATED_RETRIES)
-        last_err = err or f"version 输出中无 ChipMode 字段: {out.strip()[:120]!r}"
+        last_err = err or f"xp_kernel_dts 无法识别: {dts[:120]!r}"
     last_chipmode_error = f"{serial}: {last_err}"
     return "unknown"
 
@@ -207,7 +203,7 @@ def ssh_devices(timeout=3):
 def detect_devices(timeout=15):
     """返回 [(serial, chipmode, source), ...]; source = 'adb' | 'fastboot' | 'ssh'。
 
-    adb 设备用 `adb shell version` 读 ChipMode; fastboot 设备读 board-type 映射,
+    adb 设备读设备树节点 xp_kernel_dts 判 ChipMode; fastboot 设备读 board-type 映射,
     使设备已处于 fastboot 模式时也能被识别并直接刷大包; ssh 设备按固定 IP 实登
     一次 (免密 root SSH, 用于网络刷小包, serial 即 IP)。
     同一 ChipMode 优先用 USB 直连 (adb/fastboot), 只有未被覆盖时才补 ssh 设备。
