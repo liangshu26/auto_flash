@@ -30,6 +30,7 @@ import argparse
 
 import common
 import mcu
+import transport
 
 # target -> (大包类别, 小包类别)
 TARGET_CATS = {
@@ -364,12 +365,14 @@ def flash_small(target, pkg, work_root, log, dry_run, use_ssh=False):
     return _run_deploy(os.path.dirname(deploy), script, stype, target, log)
 
 
-def flash_mcu(pkg, serial, work_root, log, dry_run):
+def flash_mcu(pkg, serial, work_root, log, dry_run, use_ssh=False):
     work = _work_dir_for(pkg, work_root)
     if dry_run:
         log(f"[DRY-RUN] extract {pkg}")
         log("[DRY-RUN] find *_APPA.hex / *_APPB.hex in extracted dir")
-        log(f"[DRY-RUN] mcu.flash_mcu(serial={serial}) via adb (A/B 双区)")
+        if use_ssh:
+            log(f"[DRY-RUN] scp *_APPA.hex / *_APPB.hex root@{serial}:/xdata/latest_aurix/")
+        log(f"[DRY-RUN] mcu.flash_mcu(serial={serial}) via {'ssh' if use_ssh else 'adb'} (A/B 双区)")
         return True
     if not extract_pkg(pkg, work, log):
         return False
@@ -379,7 +382,7 @@ def flash_mcu(pkg, serial, work_root, log, dry_run):
         log(f"[ERROR] *_APPA.hex / *_APPB.hex not found in {pkg}")
         return False
     log(f"[INFO] Flash MCU via mcu.flash_mcu (serial={serial})")
-    return mcu.flash_mcu(appa, appb, serial=serial, slave=False, log=log)
+    return mcu.flash_mcu(appa, appb, serial=serial, slave=False, log=log, use_ssh=use_ssh)
 
 
 # ---------------------------------------------------------------- 已解压目录刷机
@@ -415,11 +418,13 @@ def flash_small_extracted(target, extracted_dir, log, dry_run, use_ssh=False):
     return _run_deploy(os.path.dirname(deploy), script, stype, target, log)
 
 
-def flash_mcu_extracted(extracted_dir, serial, log, dry_run):
+def flash_mcu_extracted(extracted_dir, serial, log, dry_run, use_ssh=False):
     """MCU 刷机, 使用已解压目录。"""
     if dry_run:
         log(f"[DRY-RUN] find *_APPA.hex / *_APPB.hex in {extracted_dir}")
-        log(f"[DRY-RUN] mcu.flash_mcu(serial={serial}) via adb (A/B 双区)")
+        if use_ssh:
+            log(f"[DRY-RUN] scp *_APPA.hex / *_APPB.hex root@{serial}:/xdata/latest_aurix/")
+        log(f"[DRY-RUN] mcu.flash_mcu(serial={serial}) via {'ssh' if use_ssh else 'adb'} (A/B 双区)")
         return True
     appa = _find_suffix(extracted_dir, "_APPA.hex")
     appb = _find_suffix(extracted_dir, "_APPB.hex")
@@ -427,70 +432,80 @@ def flash_mcu_extracted(extracted_dir, serial, log, dry_run):
         log(f"[ERROR] *_APPA.hex / *_APPB.hex not found in {extracted_dir}")
         return False
     log(f"[INFO] Flash MCU via mcu.flash_mcu (serial={serial})")
-    return mcu.flash_mcu(appa, appb, serial=serial, slave=False, log=log)
+    return mcu.flash_mcu(appa, appb, serial=serial, slave=False, log=log, use_ssh=use_ssh)
 
 
 # ---------------------------------------------------------------- VLMU MCU 刷机
-def flash_vlmu_mcu(pkg, serial, work_root, log, dry_run):
+def flash_vlmu_mcu(pkg, serial, work_root, log, dry_run, use_ssh=False):
     """VLMU MCU 刷机: 解压外层包, 找到内层 OTA 包, 推送到设备并执行升级。
-    
+
     如果 pkg 本身就是 VLMUMCU_*.zip, 直接推送升级, 不解压。
-    解压到包所在目录 (不放到 .extracted)。
+    解压到包所在目录 (不放到 .extracted)。use_ssh 时走 scp/ssh。
     """
     pkg_basename = os.path.basename(pkg)
-    
+    push_cmd = "scp" if use_ssh else "adb push"
+
     # 检查是否直接是 VLMUMCU_*.zip
     if pkg_basename.startswith("VLMUMCU") and pkg_basename.endswith(".zip"):
         log(f"[INFO] 直接使用 VLMU MCU OTA 包: {pkg_basename}")
         if dry_run:
-            log(f"[DRY-RUN] adb push {pkg_basename} to /tmp/ on VLMU (serial={serial})")
+            log(f"[DRY-RUN] {push_cmd} {pkg_basename} to /tmp/ on VLMU (serial={serial})")
             log("[DRY-RUN] execute upgrade commands on VLMU")
             return True
-        return _do_flash_vlmu_mcu_direct(pkg, serial, log)
-    
+        return _do_flash_vlmu_mcu_direct(pkg, serial, log, use_ssh)
+
     # 否则解压到包所在目录
     pkg_dir = os.path.dirname(os.path.abspath(pkg))
     work = _work_dir_for(pkg, pkg_dir)  # 解压到包所在目录, 不是 .extracted
     if dry_run:
         log(f"[DRY-RUN] extract {pkg} -> {work}")
         log(f"[DRY-RUN] find OTAPackage/VLMUMCU_*.zip in extracted dir")
-        log(f"[DRY-RUN] adb push to /tmp/ on VLMU (serial={serial})")
+        log(f"[DRY-RUN] {push_cmd} to /tmp/ on VLMU (serial={serial})")
         log("[DRY-RUN] execute upgrade commands on VLMU")
         return True
     if not extract_pkg(pkg, work, log):
         return False
-    return _do_flash_vlmu_mcu(work, serial, log)
+    return _do_flash_vlmu_mcu(work, serial, log, use_ssh)
 
 
-def flash_vlmu_mcu_extracted(extracted_dir, serial, log, dry_run):
+def flash_vlmu_mcu_extracted(extracted_dir, serial, log, dry_run, use_ssh=False):
     """VLMU MCU 刷机, 使用已解压目录。"""
     if dry_run:
+        push_cmd = "scp" if use_ssh else "adb push"
         log(f"[DRY-RUN] find OTAPackage/VLMUMCU_*.zip in {extracted_dir}")
-        log(f"[DRY-RUN] adb push to /tmp/ on VLMU (serial={serial})")
+        log(f"[DRY-RUN] {push_cmd} to /tmp/ on VLMU (serial={serial})")
         log("[DRY-RUN] execute upgrade commands on VLMU")
         return True
-    return _do_flash_vlmu_mcu(extracted_dir, serial, log)
+    return _do_flash_vlmu_mcu(extracted_dir, serial, log, use_ssh)
 
 
-def _do_flash_vlmu_mcu_direct(ota_pkg, serial, log):
-    """直接推送 VLMUMCU_*.zip 并升级。"""
+def _push_ota(t, ota_pkg, log):
+    """推 OTA 包到 /tmp/。adb 仅查 rc; ssh 额外做文件名闸与远端 md5 校验。"""
     ota_filename = os.path.basename(ota_pkg)
-    log(f"[INFO] VLMU MCU OTA package: {ota_filename}")
-    
-    # 推送 OTA 包到设备 /tmp
+    if t.name == "ssh" and not transport.basename_ok(ota_filename):
+        log(f"[ERROR] 文件名含远端 shell 不安全字符, 拒绝推送: {ota_filename}")
+        return False
     log(f"[INFO] Pushing {ota_filename} to VLMU /tmp/ ...")
-    rc = common.run_streaming(
-        ["adb", "-s", serial, "push", ota_pkg, f"/tmp/{ota_filename}"],
-        log=log
-    )
+    rc = t.push(ota_pkg, f"/tmp/{ota_filename}", log)
     if rc != 0:
         log(f"[ERROR] Failed to push OTA package to device (rc={rc})")
         return False
-    
-    return _run_vlmu_mcu_upgrade(ota_filename, serial, log)
+    if t.name == "ssh" and not transport.remote_md5_ok(t, ota_pkg, f"/tmp/{ota_filename}", log):
+        return False
+    return True
 
 
-def _do_flash_vlmu_mcu(extracted_dir, serial, log):
+def _do_flash_vlmu_mcu_direct(ota_pkg, serial, log, use_ssh=False):
+    """直接推送 VLMUMCU_*.zip 并升级。"""
+    ota_filename = os.path.basename(ota_pkg)
+    log(f"[INFO] VLMU MCU OTA package: {ota_filename}")
+    t = transport.for_device(serial, use_ssh)
+    if not _push_ota(t, ota_pkg, log):
+        return False
+    return _run_vlmu_mcu_upgrade(ota_filename, t, log)
+
+
+def _do_flash_vlmu_mcu(extracted_dir, serial, log, use_ssh=False):
     """执行 VLMU MCU 升级的实际逻辑。"""
     # 查找内层 OTA 包 (OTAPackage/VLMUMCU_*.zip)
     matches = _find_files_with_prefix(extracted_dir, "VLMUMCU_", path_contains="OTAPackage")
@@ -504,40 +519,22 @@ def _do_flash_vlmu_mcu(extracted_dir, serial, log):
         for m in matches:
             log(f"[WARN]   {os.path.basename(m)}")
     ota_pkg = max(matches, key=os.path.getmtime)
-    
+
     ota_filename = os.path.basename(ota_pkg)
     log(f"[INFO] Found VLMU MCU OTA package: {ota_filename}")
-    
-    # 推送 OTA 包到设备 /tmp
-    log(f"[INFO] Pushing {ota_filename} to VLMU /tmp/ ...")
-    rc = common.run_streaming(
-        ["adb", "-s", serial, "push", ota_pkg, f"/tmp/{ota_filename}"],
-        log=log
-    )
-    if rc != 0:
-        log(f"[ERROR] Failed to push OTA package to device (rc={rc})")
+    t = transport.for_device(serial, use_ssh)
+    if not _push_ota(t, ota_pkg, log):
         return False
-    
-    return _run_vlmu_mcu_upgrade(ota_filename, serial, log)
+    return _run_vlmu_mcu_upgrade(ota_filename, t, log)
 
 
-def _adb_offline(line):
-    """判断一行是否是 adb 因设备离线/重启打出的错误噪声。"""
-    s = line.strip()
-    return (s.startswith("error:") or "device not found" in s
-            or "device offline" in s or "no devices/emulators found" in s)
-
-
-def _run_vlmu_mcu_upgrade(ota_filename, serial, log):
-    """在 VLMU 设备上执行升级命令。"""
+def _run_vlmu_mcu_upgrade(ota_filename, t, log):
+    """在 VLMU 设备上执行升级命令 (t 为 adb/ssh 传输)。"""
     # Step 1: killall -9 update_service
     log("[INFO] Step 1: killall -9 update_service")
-    rc = common.run_streaming(
-        ["adb", "-s", serial, "shell", "killall -9 update_service"],
-        log=log
-    )
+    rc = t.shell_stream("killall -9 update_service", log)
     log(f"[INFO] killall returned: {rc}")
-    
+
     # Step 2: 创建启动脚本并推送到设备
     log("[INFO] Step 2: Creating startup script on device...")
     script_content = f"""#!/bin/sh
@@ -549,85 +546,77 @@ source /xpilot/xlauncher/scripts/env.bash
     with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
         f.write(script_content)
         local_script = f.name
-    
+
+    proc = None
     try:
         # 推送脚本到设备
-        rc = common.run_streaming(
-            ["adb", "-s", serial, "push", local_script, "/tmp/start_vlmu_mcu.sh"],
-            log=log
-        )
+        rc = t.push(local_script, "/tmp/start_vlmu_mcu.sh", log)
         if rc != 0:
             log("[ERROR] Failed to push startup script")
             return False
-        
+
         # 设置执行权限
-        common.run_streaming(
-            ["adb", "-s", serial, "shell", "chmod +x /tmp/start_vlmu_mcu.sh"],
-            log=log
-        )
-        
+        t.shell_stream("chmod +x /tmp/start_vlmu_mcu.sh", log)
+
         # 清空旧日志, 方便监控新日志
         log("[INFO] Clearing old log file...")
-        common.run_streaming(
-            ["adb", "-s", serial, "shell", "> /xdata/log/latest/update_service.txt.log"],
-            log=log
-        )
-        
+        clear_rc = t.shell_stream("> /xdata/log/latest/update_service.txt.log", log)
+        if t.name == "ssh":
+            # 残留日志可能含上次的 Success, 清失败必须中止, 否则会误判成功
+            remain = t.shell_capture("cat /xdata/log/latest/update_service.txt.log")
+            if clear_rc != 0 or remain.strip():
+                log("[ERROR] 清空升级日志失败, 中止 (防上次残留误判成功)")
+                return False
+
         # 在前台执行脚本, 但输出重定向到 /dev/null
         # 我们通过读取日志文件来监控进度
         log("[INFO] Step 3: Running update_service (monitoring log file)...")
-        
-        # 启动 adb shell 执行升级脚本, 登记到进程表以便 GUI 关窗时清理
-        import subprocess
-        proc = subprocess.Popen(
-            ["adb", "-s", serial, "shell", "/tmp/start_vlmu_mcu.sh"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL
-        )
+
+        # 启动远端 shell 执行升级脚本, 登记到进程表以便 GUI 关窗时清理
+        proc = t.spawn("/tmp/start_vlmu_mcu.sh")
         common.track_proc(proc)
-        
+
         # 监控日志文件
         log("[INFO] Step 4: Monitoring upgrade progress from log file...")
 
         # conclusion: True=成功, False=失败, None=未判定
-        # 升级成功后会 SwitchReboot, 设备立即重启掉线, 之后任何 adb 查询都只会拿到
-        # "device not found", 因此结果必须在监控阶段锁存, 不能事后重查覆盖。
+        # 升级成功后会 SwitchReboot, 设备立即重启掉线, 之后任何查询都只会拿到
+        # 掉线噪声, 因此结果必须在监控阶段锁存, 不能事后重查覆盖。
         conclusion = None
         saw_100 = False
         saw_reboot = False
 
         for i in range(600):  # 最多等待 10 分钟
             time.sleep(1)
-            
+
             # 检查进程是否还在运行
             if proc.poll() is not None:
                 log(f"[INFO] update_service process exited with code: {proc.returncode}")
                 # 进程退出了, 再读一次日志确认结果
                 time.sleep(1)
-            
+
             # 每 5 秒读取一次日志
             if i % 5 == 0:
                 # 检查进度
                 progress_output = []
-                common.run_streaming(
-                    ["adb", "-s", serial, "shell", "grep 'Current upgrade progress' /xdata/log/latest/update_service.txt.log | tail -1"],
-                    log=lambda x: progress_output.append(x) if not _adb_offline(x) else None
+                t.shell_stream(
+                    "grep 'Current upgrade progress' /xdata/log/latest/update_service.txt.log | tail -1",
+                    log=lambda x: progress_output.append(x) if not t.is_offline_noise(x) else None
                 )
-                
+
                 if progress_output:
                     progress_line = progress_output[0].strip()
                     log(f"[INFO] {i}s: {progress_line}")
                     if "100%" in progress_line:
                         saw_100 = True
-                
+
                 # 检查是否完成
                 check_output = []
-                common.run_streaming(
-                    ["adb", "-s", serial, "shell", "grep -E 'Upgrade progress 100%|FlashExit|SwitchReboot' /xdata/log/latest/update_service.txt.log | tail -3"],
-                    log=lambda x: check_output.append(x) if not _adb_offline(x) else None
+                t.shell_stream(
+                    "grep -E 'Upgrade progress 100%|FlashExit|SwitchReboot' /xdata/log/latest/update_service.txt.log | tail -3",
+                    log=lambda x: check_output.append(x) if not t.is_offline_noise(x) else None
                 )
-                
+
                 for line in check_output:
                     if "Upgrade progress 100%" in line:
                         saw_100 = True
@@ -635,31 +624,31 @@ source /xpilot/xlauncher/scripts/env.bash
                     if "SwitchReboot" in line and "failed" not in line:
                         saw_reboot = True
                         log(f"[INFO] {i}s: {line.strip()}")
-                
+
                 # 检查是否成功完成
                 success_output = []
-                common.run_streaming(
-                    ["adb", "-s", serial, "shell", "grep -E 'Upgrade progress 100%.*Success|FlashExit.*Success' /xdata/log/latest/update_service.txt.log | tail -1"],
-                    log=lambda x: success_output.append(x) if not _adb_offline(x) else None
+                t.shell_stream(
+                    "grep -E 'Upgrade progress 100%.*Success|FlashExit.*Success' /xdata/log/latest/update_service.txt.log | tail -1",
+                    log=lambda x: success_output.append(x) if not t.is_offline_noise(x) else None
                 )
-                
+
                 if success_output:
                     log(f"[OK] Upgrade completed successfully at {i}s")
                     conclusion = True
                     break
-                
+
                 # 检查是否失败
                 fail_output = []
-                common.run_streaming(
-                    ["adb", "-s", serial, "shell", "grep 'Fail!!!' /xdata/log/latest/update_service.txt.log | tail -1"],
-                    log=lambda x: fail_output.append(x) if not _adb_offline(x) else None
+                t.shell_stream(
+                    "grep 'Fail!!!' /xdata/log/latest/update_service.txt.log | tail -1",
+                    log=lambda x: fail_output.append(x) if not t.is_offline_noise(x) else None
                 )
-                
+
                 if fail_output:
                     log(f"[ERROR] Upgrade failed at {i}s: {fail_output[0].strip()}")
                     conclusion = False
                     break
-                
+
                 # 设备已开始重启 -> 升级流程已走完 (成功标志可能来不及抓到)
                 if saw_reboot:
                     log(f"[OK] {i}s: 设备已进入 SwitchReboot, 升级流程完成")
@@ -668,28 +657,36 @@ source /xpilot/xlauncher/scripts/env.bash
 
                 # 如果进程退出了且没有明确的成功/失败标志
                 if proc.poll() is not None and i > 30:
-                    if saw_100 and proc.returncode == 0:
+                    prc = proc.returncode
+                    if t.is_transport_drop_rc(prc):
+                        # ssh 断开 (设备可能重启): 不据此判成败, 转兜底 (会先等 ssh 回来)
+                        log(f"[INFO] {i}s: ssh 会话关闭 (rc={prc}), 设备可能正在重启, 转入结果兜底查询")
+                        break
+                    if saw_100 and prc == 0:
                         log(f"[OK] {i}s: 进度已达 100% 且 update_service 退出码为 0")
                         conclusion = True
                     else:
                         log("[WARN] Process exited but no clear success/fail flag found")
                     break
     finally:
-        common.untrack_proc(proc)
+        if proc is not None:
+            common.untrack_proc(proc)
         # 清理本地临时文件
         try:
             os.unlink(local_script)
         except OSError:
             pass
-    
+
     # Step 5/6: 仅在监控阶段没得出结论时才兜底查询。
-    # 若已成功, 设备正在重启, 再查只会拿到 "device not found", 反而误判为失败。
+    # 若已成功, 设备正在重启, 再查只会拿到掉线噪声, 反而误判为失败。
     if conclusion is None:
         log("[INFO] Step 5: Checking upgrade result...")
+        if t.name == "ssh" and not t.is_online():
+            t.wait_online(log, retries=12, interval=5)
         success_output = []
-        common.run_streaming(
-            ["adb", "-s", serial, "shell", "grep -E 'Upgrade progress 100%|FlashExit|SwitchReboot' /xdata/log/latest/update_service.txt.log | tail -5"],
-            log=lambda x: success_output.append(x) if not _adb_offline(x) else None
+        t.shell_stream(
+            "grep -E 'Upgrade progress 100%|FlashExit|SwitchReboot' /xdata/log/latest/update_service.txt.log | tail -5",
+            log=lambda x: success_output.append(x) if not t.is_offline_noise(x) else None
         )
 
         for line in success_output:
@@ -701,10 +698,7 @@ source /xpilot/xlauncher/scripts/env.bash
 
         # Step 6: 显示最终日志
         log("[INFO] Step 6: Final upgrade log (last 30 lines):")
-        common.run_streaming(
-            ["adb", "-s", serial, "shell", "tail -30 /xdata/log/latest/update_service.txt.log"],
-            log=log
-        )
+        t.shell_stream("tail -30 /xdata/log/latest/update_service.txt.log", log)
 
     if conclusion:
         log("[OK] VLMU MCU upgrade completed successfully.")
@@ -724,9 +718,9 @@ def _run_job(kind, target, pkg, serial, work_root, log, dry_run, dev_source="adb
     if kind == "small":
         return flash_small(target, pkg, work_root, log, dry_run, use_ssh=(dev_source == "ssh"))
     if kind == "mcu":
-        return flash_mcu(pkg, serial, work_root, log, dry_run)
+        return flash_mcu(pkg, serial, work_root, log, dry_run, use_ssh=(dev_source == "ssh"))
     if kind == "vlmu_mcu":
-        return flash_vlmu_mcu(pkg, serial, work_root, log, dry_run)
+        return flash_vlmu_mcu(pkg, serial, work_root, log, dry_run, use_ssh=(dev_source == "ssh"))
     log(f"[ERROR]   unknown job kind: {kind}")
     return False
 
@@ -744,9 +738,9 @@ def _run_job_extracted(kind, target, extracted_dir, serial, log, dry_run, dev_so
         return flash_small_extracted(target, extracted_dir, log, dry_run,
                                      use_ssh=(dev_source == "ssh"))
     if kind == "mcu":
-        return flash_mcu_extracted(extracted_dir, serial, log, dry_run)
+        return flash_mcu_extracted(extracted_dir, serial, log, dry_run, use_ssh=(dev_source == "ssh"))
     if kind == "vlmu_mcu":
-        return flash_vlmu_mcu_extracted(extracted_dir, serial, log, dry_run)
+        return flash_vlmu_mcu_extracted(extracted_dir, serial, log, dry_run, use_ssh=(dev_source == "ssh"))
     log(f"[ERROR]   unknown job kind: {kind}")
     return False
 
@@ -807,26 +801,25 @@ def _build_maps(devices):
     大包走 fastboot, 只认 USB 直连 (adb/fastboot): 把 ssh 的 IP 喂给
     adc_flashall.sh 只会得到 "Doesn't have a device with serial number <IP>" (big);
     小包走 adb 或 ssh 网络部署, 排除 fastboot (small);
-    MCU/VLMU MCU 只能走 adb, 排除 fastboot 与 ssh (adb)。
-    source 记录每个 serial 的接入方式, 供小包选择部署脚本。
+    MCU/VLMU MCU adb 优先, 无 USB 时自动回退 ssh, 同样排除 fastboot (adb_ssh)。
+    source 记录每个 serial 的接入方式, 供小包/MCU 选择 adb 或 ssh 通道。
     """
     def src_of(d):
         return d[2] if len(d) > 2 else "adb"
 
     small_capable = [d for d in devices if src_of(d) != "fastboot"]
     usb_capable = [d for d in devices if src_of(d) != "ssh"]
-    adb_only = [d for d in devices if src_of(d) == "adb"]
     return {
         "all": build_serial_map(devices),
         "big": build_serial_map(usb_capable),
         "small": build_serial_map(small_capable),
-        "adb": build_serial_map(adb_only),
+        "adb_ssh": build_serial_map(small_capable),
         "source": {d[0]: src_of(d) for d in devices},
     }
 
 
 # kind -> _build_maps 里对应的映射键
-KIND_MAP = {"big": "big", "small": "small", "mcu": "adb", "vlmu_mcu": "adb"}
+KIND_MAP = {"big": "big", "small": "small", "mcu": "adb_ssh", "vlmu_mcu": "adb_ssh"}
 
 # 任务间重探时设备可能刚被上个任务刷重启 (小包 deploy 结尾就 reboot xpu),
 # adb/fastboot 要一两分钟才回来。上限对齐 aurix_v7_xp5.sh 的 wait_device_online
@@ -900,7 +893,7 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
 
         if not dry_run and not serial:
             if serial_for_target(target, maps["all"], force_serial):
-                # 设备在线但不满足该刷法: fastboot 只能刷大包; ssh 不能刷 MCU
+                # 设备在线但不满足该刷法: fastboot 只能刷大包, 不能刷小包/MCU
                 log(f"[WARN] '{target}' 设备当前接入方式不支持刷 {kind}, 跳过: {name}")
             else:
                 log(f"[WARN] '{target}' 无在线匹配设备, 跳过: {name}")
@@ -998,7 +991,7 @@ def build_parser():
     p.add_argument("--small", action="store_true", help="只用小包 (deploy_xpilot_by_adb.sh)")
     p.add_argument("--pkg", action="append", default=[], metavar="KIND:TARGET:PATH",
                    help="可重复: 直接刷指定包 (供 GUI 单刷用), 跳过目录扫描。"
-                        "KIND=big|small|mcu, TARGET=xp5_a|xp5_b|vlmu|mcu, PATH=包绝对路径")
+                        "KIND=big|small|mcu|vlmu_mcu, TARGET=xp5_a|xp5_b|vlmu|mcu, PATH=包绝对路径")
     p.add_argument("-n", "--dry-run", action="store_true", help="只打印计划, 不实际刷")
     return p
 
@@ -1012,8 +1005,8 @@ def _parse_pkg_specs(specs, log=print):
             log(f"[ERROR] 无效 --pkg (应为 KIND:TARGET:PATH): {spec}")
             return None
         kind, target, path = parts
-        if kind not in ("big", "small", "mcu"):
-            log(f"[ERROR] 无效 --pkg KIND: {kind} (用 big|small|mcu)")
+        if kind not in ("big", "small", "mcu", "vlmu_mcu"):
+            log(f"[ERROR] 无效 --pkg KIND: {kind} (用 big|small|mcu|vlmu_mcu)")
             return None
         jobs.append((kind, target, path))
     return jobs

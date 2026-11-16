@@ -42,7 +42,9 @@ fastboot -s <serial> getvar board-type              # 注意 getvar 输出在 st
 - master / slave Aurix 是两颗芯片，都经 SoC_A 访问，slave 用 `--m=1` 区分。
 - **大包只能走 USB (adb/fastboot)**。把 ssh 的 IP 当序列号喂给 `adc_flashall.sh`
   必然得到 `Doesn't have a device with serial number <IP>`。
-- **MCU 只能走 adb**，不支持 fastboot 模式，也不支持 ssh。
+- **MCU / VLMU MCU 不支持 fastboot 模式**。adb 优先；无 USB 直连但免密 root ssh
+  可达时，auto_flash 会自动回退走 ssh（与小包一致，无需手动开关）。下面的
+  `aurix_v7_xp5.sh` 与手动 adb 命令仍是 adb 通道；ssh 通道由工具内部用 scp/ssh 等价实现。
 - 小包 adb / ssh 都可以，但设备处于 fastboot 模式时不能刷小包。
 - 探测 ssh 设备在线要**真登一次**（`ssh -o BatchMode=yes root@<ip> true`）。
   只 TCP 连 22 端口会误判：端口通但免密没配好、或 IP 被别的机器占着时，
