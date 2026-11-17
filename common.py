@@ -340,7 +340,25 @@ def _is_extracted_package(dirpath):
             if item.endswith("_APPA.hex") or item.endswith("_APPB.hex"):
                 return True
     except OSError:
-        pass
+        return False
+    # MCU 包的 hex 嵌套在 XPF/<build>/ 下, 顶层看不到, 需有限深度搜索
+    return _has_nested_mcu_hex(dirpath)
+
+
+def _has_nested_mcu_hex(dirpath, max_depth=3):
+    """在子目录里有限深度搜索 *_APPA.hex / *_APPB.hex (MCU 包标志)。
+
+    只在顶层 markers 未命中时调用 (大包/小包/VLMU MCU 顶层就有标记, 已提前返回),
+    故主要扫的是 MCU 解压目录, 体量小; 深度上限避免误扫无关大目录。
+    """
+    base = dirpath.rstrip(os.sep).count(os.sep)
+    for root, dirs, files in os.walk(dirpath):
+        if root.rstrip(os.sep).count(os.sep) - base >= max_depth:
+            dirs[:] = []
+            continue
+        for f in files:
+            if f.endswith("_APPA.hex") or f.endswith("_APPB.hex"):
+                return True
     return False
 
 
