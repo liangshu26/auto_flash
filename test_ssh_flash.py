@@ -465,6 +465,35 @@ class TestMcuSsh(TransportTest):
         self.assertTrue(ok)
         self.assertTrue(any(a[0] == "scp" for a in self.board.argv_of("stream")))
 
+    def test_slow_switch_retry_then_succeeds(self):
+        appa, appb = self.hex_files()
+        # -v 调用序: [预检 B, 重启后第1次 B(未切), 第2次 A(切好)]
+        self.setup_board(appa, appb, zones=("B", "B", "A"))
+        ok = mcu.flash_mcu(appa, appb, serial=self.IP, use_ssh=True, log=self.quiet)
+        self.assertTrue(ok)
+        self.assertEqual(len(self.updates()), 2)          # 重试切成后刷了第二区
+        self.assertIn(5, self.board.sleeps)               # 发生过重试等待
+
+    def test_switch_retry_exhausted_aborts(self):
+        appa, appb = self.hex_files()
+        b = self.setup_board(appa, appb, zones=("B",))    # 始终 B, 切不过去
+        ok = mcu.flash_mcu(appa, appb, serial=self.IP, use_ssh=True, log=self.quiet)
+        self.assertFalse(ok)
+        self.assertEqual(len(self.updates()), 1)          # 没刷第二区
+        self.assertEqual(b.sleeps.count(5), 6)            # 6 次重试间隔
+        vreads = sum(1 for k, a in b.calls
+                     if k == "run" and "aurix_utility -v" in a[-1])
+        self.assertEqual(vreads, 8)                       # 预检 1 + 重试 7
+
+    def test_switch_check_logs_raw_zone(self):
+        appa, appb = self.hex_files()
+        self.setup_board(appa, appb, zones=("A", "B"))
+        logs = []
+        ok = mcu.flash_mcu(appa, appb, serial=self.IP, use_ssh=True,
+                           log=lambda s="": logs.append(s))
+        self.assertTrue(ok)
+        self.assertTrue(any("aurix -v:" in l and "Aurix active boot" in l for l in logs))
+
 
 # ---------------------------------------------------------------- VLMU ssh
 class TestVlmuSsh(TransportTest):

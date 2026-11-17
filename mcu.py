@@ -63,13 +63,20 @@ def _copy_image(t, appa, appb, log):
     return True
 
 
-def _check_zone(t, slave_opt, log):
+def _check_zone(t, slave_opt, log, verbose=False):
     """读 aurix_utility -v, 判断当前运行区 (A=1 / B=2)。失败或解析不到返回 0。"""
     out = t.shell_capture(f"{AURIX_UTIL} -v{slave_opt}")
+    boot_lines = [l for l in out.splitlines() if "Aurix active boot" in l]
+    if verbose:
+        # 打印原始区信息, 便于诊断"刷上了却报切区失败"
+        if boot_lines:
+            for l in boot_lines:
+                log(f"[INFO] aurix -v: {l.strip()}")
+        else:
+            log(f"[INFO] aurix -v 无 'Aurix active boot' 行, 原始输出: {out.strip()[:200]!r}")
     if not out.strip():
         log(f"[ERROR] 无法从设备 {t.serial} 读取 aurix 区信息")
         return ZONE_UNKNOWN
-    boot_lines = [l for l in out.splitlines() if "Aurix active boot" in l]
     # ssh 下 banner/MOTD 可能污染 stdout: 同时出现 :A 与 :B 判未知, 不冒险
     if t.name == "ssh":
         if any(":A" in l for l in boot_lines) and any(":B" in l for l in boot_lines):
@@ -82,6 +89,26 @@ def _check_zone(t, slave_opt, log):
             return ZONE_B
     log("[ERROR] 无法从设备输出解析当前 Aurix 运行区")
     return ZONE_UNKNOWN
+
+
+def _wait_zone_switch(t, slave_opt, finish, log, retries=6, interval=5):
+    """刷对侧区重启后校验区已切到 finish。
+
+    Aurix 切区可能慢于 adb 回 online, 刚回来时 -v 未必反映新区, 故有限重试:
+    只重读区、绝不刷写; 切成 finish 立即返回, 重试耗尽仍不符才返回最后读到的区
+    (由调用方判 Switch failed)。与 vendor 脚本相比多了重试, 但依旧 fail-closed。
+    """
+    curr = ZONE_UNKNOWN
+    for attempt in range(retries + 1):
+        curr = _check_zone(t, slave_opt, log, verbose=True)
+        log(f"[INFO] FINISH_FLASH_ZONE: {finish}")
+        log(f"[INFO] CURR_AURIX_ZONE: {curr} (读区 {attempt + 1}/{retries + 1})")
+        if curr == finish:
+            return curr
+        if attempt < retries:
+            log(f"[WARN] 区尚未切到 {finish} (当前 {curr}), {interval}s 后重读 ...")
+            time.sleep(interval)
+    return curr
 
 
 def _flash_zone(t, hexpath, slave_opt, log, running, flashing):
@@ -161,10 +188,8 @@ def flash_mcu(appa, appb, serial=None, slave=False, log=print, use_ssh=False):
     if not t.wait_online(log):
         return False
 
-    # 校验区已切换
-    curr = _check_zone(t, slave_opt, log)
-    log(f"[INFO] FINISH_FLASH_ZONE: {finish}")
-    log(f"[INFO] CURR_AURIX_ZONE: {curr}")
+    # 校验区已切换 (切区可能慢, 有限重试只读不刷)
+    curr = _wait_zone_switch(t, slave_opt, finish, log)
     if curr != finish:
         log("[ERROR] Switch failed! Cannot Start Flash!")
         return False
