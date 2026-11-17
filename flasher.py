@@ -835,7 +835,7 @@ def _targets_online(maps, force_serial=""):
 
 
 def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
-                 results_out=None):
+                 results_out=None, progress=None):
     """按给定顺序执行 job 列表 [(kind, target, pkg_path, is_extracted), ...]。
 
     失败即停并返回 False (与 flash.sh 的 exit 语义一致)。全成功返回 True。
@@ -844,6 +844,8 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
     is_extracted: True 表示 pkg_path 是已解压目录, 跳过解压步骤。
     results_out: 可选 list, 追加 {kind,target,name,status} 供 GUI 汇总;
                  status = ok|failed|skipped。所有任务都因无设备被跳过时判失败。
+    progress: 可选回调 fn(dict), 发任务级进度事件 (task/phase/done) 供 GUI 进度条;
+              纯附加信息, 不影响刷写逻辑与成败判定。
     """
     if devices is None:
         devices = detect_and_log(log)
@@ -881,6 +883,8 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
         if not dry_run and not serial and target in seen_targets:
             log(f"[INFO] '{target}' 设备离线 (可能刚被上个任务刷重启), "
                 f"最多等待 {REBOOT_WAIT_SEC}s ...")
+            if progress:
+                progress({"type": "phase", "text": "等待设备重启恢复"})
             deadline = time.monotonic() + REBOOT_WAIT_SEC
             while not serial and time.monotonic() < deadline:
                 time.sleep(REBOOT_POLL_SEC)
@@ -901,10 +905,17 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
             if results_out is not None:
                 results_out.append({"kind": kind, "target": target,
                                     "name": name, "status": "skipped"})
+            if progress:
+                progress({"type": "task", "index": idx + 1, "total": len(jobs),
+                          "kind": kind, "target": target, "name": name, "skipped": True})
+                progress({"type": "done", "index": idx + 1, "ok": True})
             continue
 
         dev_source = maps["source"].get(serial, "adb") if serial else "adb"
         executed += 1
+        if progress:
+            progress({"type": "task", "index": idx + 1, "total": len(jobs),
+                      "kind": kind, "target": target, "name": name})
         if is_extracted:
             job_ok = _run_job_extracted(kind, target, pkg, serial, log, dry_run, dev_source)
         else:
@@ -913,6 +924,8 @@ def execute_jobs(jobs, log=print, dry_run=False, force_serial="", devices=None,
             results_out.append({"kind": kind, "target": target,
                                 "name": name,
                                 "status": "ok" if job_ok else "failed"})
+        if progress:
+            progress({"type": "done", "index": idx + 1, "ok": bool(job_ok)})
         if not job_ok:
             ok = False
             break

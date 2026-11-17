@@ -14,6 +14,7 @@ adb 设备识别、包分类等共享逻辑走 common.py。
 
 import os
 import sys
+import re
 import time
 import queue
 import threading
@@ -32,6 +33,72 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PREP_ROOT = common.default_prep_root()
 
 MODE_TO_TARGET = common.MODE_TO_TARGET
+
+
+# ---------------------------------------------------------------- 刷机进度
+KIND_LABEL = {"big": "大包", "small": "小包", "mcu": "MCU", "vlmu_mcu": "VLMU MCU"}
+
+# 各刷法的阶段里程碑 (子串 -> 阶段文字), 最具体优先。纯附加解析: 命中才更新文字,
+# 不命中返回 "" (不更新), 绝不影响刷写逻辑与成败判定。字符串来自 vendor 输出 /
+# 我方 log, 与 SKILL.md / 成败判定中使用的标记一致。
+_FLASH_PHASES = {
+    "big": [
+        ("flash all done", "大包完成"),
+        ("Flashing norflash and ufs finished", "norflash/ufs 完成"),
+        ("Waiting 20s for device to boot", "等待开机"),
+        ("Rebooting", "重启中"),
+        ("board_type:", "已进入 fastboot"),
+        ("fastboot_flashall at", "刷 norflash/ufs 分区"),
+        ("Sending '", "刷写分区中"),
+        ("Flashing ", "刷写分区中"),
+        ("Writing ", "刷写分区中"),
+        ("waiting for device to enter fastboot mode", "进入 fastboot 中"),
+    ],
+    "small": [
+        ("Copying SW apps Done", "小包完成"),
+        ("begin reboot xpu", "重启中"),
+        ("copy libs to", "推送 libs"),
+        ("start to scp", "推送文件中"),
+        ("files pushed", "推送文件中"),
+    ],
+    "mcu": [
+        ("Switch failed", "切区失败"),
+        ("upgrade success", "该区刷写成功"),
+        ("Currently Flashing Zone: A", "刷 A 区"),
+        ("Currently Flashing Zone: B", "刷 B 区"),
+        ("Currently Running on Zone", "读运行区"),
+        ("offline, waiting", "等待设备重启"),
+        ("pushing", "推送 hex"),
+    ],
+    "vlmu_mcu": [
+        ("Upgrade completed successfully", "OTA 完成"),
+        ("Fail!!!", "升级失败"),
+        ("SwitchReboot", "升级完成, 重启中"),
+        ("Step 4", "监控升级进度"),
+        ("Step 3", "启动升级"),
+        ("Step 2", "准备升级脚本"),
+        ("Step 1", "准备升级"),
+        ("Clearing old log", "清空旧日志"),
+    ],
+}
+
+
+def _flash_phase(kind, line):
+    """从一行刷机日志解析当前阶段文字; 无匹配返回 ""。只读, 不改任何状态。"""
+    if not line:
+        return ""
+    if kind == "vlmu_mcu" and "upgrade progress" in line.lower():
+        m = re.search(r"(\d+)%", line)
+        if m:
+            return f"OTA 升级 {m.group(1)}%"
+    for marker, text in _FLASH_PHASES.get(kind, ()):
+        if marker in line:
+            return text
+    if "==> Extracting" in line:
+        return "解压中"
+    if "already extracted, reuse" in line:
+        return "复用已解压"
+    return ""
 
 
 # ---------------------------------------------------------------- 主程序
@@ -64,6 +131,12 @@ class App:
         self._cancellable = True
         self._watchdog_min = 0
         self._last_dev_err = ""
+        # 刷机进度状态 (任务级进度条 + 阶段文字)
+        self._flash_active = False
+        self._flash_kind = ""
+        self._flash_total = 0
+        self._flash_index = 0
+        self._flash_step_base = ""
 
         # GUI 模式: 子进程自成进程组, 关窗时可整树杀掉
         common.set_gui_mode(True)
@@ -158,7 +231,18 @@ class App:
 
         ttk.Button(btn_frame, text="清空日志", command=self._clear_log,
                    style='Action.TButton').pack(side="right")
-        
+
+        # 刷机进度行 (任务 i/N 进度条 + 当前阶段文字), 空闲时隐藏, 刷机时显示。
+        # 用 pack(before=self.log, side=bottom) 固定在按钮栏上方、日志下方。
+        self._flash_prog_frame = ttk.Frame(logf)
+        self._flash_step_var = tk.StringVar(value="")
+        ttk.Label(self._flash_prog_frame, textvariable=self._flash_step_var,
+                  font=('Helvetica', 9), foreground='#34495e', anchor="w").pack(
+            fill="x", padx=8, pady=(2, 0))
+        self._flash_bar = ttk.Progressbar(self._flash_prog_frame, orient="horizontal",
+                                          mode="determinate", maximum=1, value=0)
+        self._flash_bar.pack(fill="x", padx=8, pady=(2, 4))
+
         # 日志文本区域 (后打包, 填充剩余空间)
         self.log = ScrolledText(logf, height=22, wrap="word", state="disabled",
                                 bg="#1e1e1e", fg="#d4d4d4", insertbackground="#d4d4d4",
@@ -170,6 +254,10 @@ class App:
                            ("err", "#f48771"), ("dim", "#808080"),
                            ("info", "#dcdcaa"), ("warn", "#ce9178")):
             self.log.tag_config(tag, foreground=color)
+
+        # 进度行初始隐藏 (刷机开始时再 pack 显示)
+        self._flash_prog_frame.pack(fill="x", side="bottom", before=self.log)
+        self._flash_prog_frame.pack_forget()
 
     def _init_log_sash(self, _tries=0):
         """设初始分隔位置: 日志占 ~40%。两个选项卡内容均可滚动, 故选项卡只保底
@@ -903,7 +991,10 @@ class App:
         results = []
 
         def job(log, prog):
-            return flasher.execute_jobs(jobs, log=log, results_out=results)
+            self._q.put(("flashprog", {"type": "start", "total": len(jobs)}))
+            return flasher.execute_jobs(
+                jobs, log=log, results_out=results,
+                progress=lambda ev: self._q.put(("flashprog", ev)))
 
         def after():
             # 刷机会产生解压目录, 结束后刷新包列表
@@ -954,6 +1045,7 @@ class App:
             self.status_var.set("运行中..." if self._cancellable else "刷机中 (不可取消)...")
         else:
             self.status_var.set("就绪")
+            self._hide_flash_prog()
         if busy:
             self._task_started_at = time.monotonic()
         else:
@@ -1066,11 +1158,62 @@ class App:
         else:
             tag = ""
         self._q.put(("log", (tag, text + "\n")))
+        # 刷机进行中: 从日志里程碑解析当前阶段, 喂给进度行 (只读, 不影响上色/落盘)
+        if self._flash_active:
+            phase = _flash_phase(self._flash_kind, text)
+            if phase:
+                self._q.put(("flashprog", {"type": "phase", "text": phase}))
 
     def _job_progress(self, written, total, speed, eta_str):
         """下载进度回调, 实时更新状态栏。"""
         # 通过队列发送到主线程更新
         self._q.put(("progress", (written, total, speed, eta_str)))
+
+    def _apply_flash_prog(self, ev):
+        """主线程落地刷机进度事件: 任务级进度条 + 阶段文字。"""
+        t = ev.get("type")
+        if t == "start":
+            self._flash_active = True
+            self._flash_total = ev.get("total", 0) or 0
+            self._flash_index = 0
+            self._flash_kind = ""
+            self._flash_step_base = ""
+            self._flash_bar.configure(maximum=max(1, self._flash_total), value=0)
+            self._flash_step_var.set("准备刷机...")
+            self._flash_prog_frame.pack(fill="x", side="bottom", before=self.log)
+        elif t == "task":
+            idx = ev.get("index", 0)
+            total = ev.get("total", self._flash_total) or self._flash_total
+            self._flash_kind = ev.get("kind", "")
+            self._flash_index = idx
+            self._flash_total = total
+            label = KIND_LABEL.get(self._flash_kind, self._flash_kind)
+            self._flash_step_base = f"任务 {idx}/{total} · {label} {ev.get('target', '')}"
+            self._flash_bar.configure(maximum=max(1, total))
+            if ev.get("skipped"):
+                self._flash_bar.configure(value=idx)
+                self._flash_step_var.set(self._flash_step_base + " · 跳过 (无设备)")
+            else:
+                self._flash_bar.configure(value=max(0, idx - 1))
+                self._flash_step_var.set(f"{self._flash_step_base} · {ev.get('name', '')}")
+        elif t == "phase":
+            text = ev.get("text", "")
+            if self._flash_step_base:
+                self._flash_step_var.set(f"{self._flash_step_base} · {text}")
+            elif text:
+                self._flash_step_var.set(text)
+        elif t == "done":
+            self._flash_bar.configure(value=ev.get("index", self._flash_index))
+
+    def _hide_flash_prog(self):
+        self._flash_active = False
+        self._flash_kind = ""
+        self._flash_step_base = ""
+        try:
+            self._flash_prog_frame.pack_forget()
+            self._flash_bar.configure(value=0)
+        except tk.TclError:
+            pass
 
     # ------------------------------------------------------------ 日志 / 队列
     def _log(self, tag, text):
@@ -1146,6 +1289,7 @@ class App:
         logs = []       # [(tag, text)]
         uis = []
         finishes = []
+        flashprogs = []
         progress = None
         try:
             while True:
@@ -1156,6 +1300,8 @@ class App:
                     uis.append(payload)
                 elif kind == "finish":
                     finishes.append(payload)
+                elif kind == "flashprog":
+                    flashprogs.append(payload)  # 逐条按序落地 (任务/阶段事件都要)
                 elif kind == "progress":
                     progress = payload  # 只保留最新的进度
         except queue.Empty:
@@ -1184,6 +1330,13 @@ class App:
                 self.log.delete("1.0", f"{linecount - self.MAXLINES}.0")
             self.log.see("end")
             self.log.configure(state="disabled")
+
+        # 刷机进度事件按序落地 (单条坏不影响其余, 更不中断 after 链)
+        for ev in flashprogs:
+            try:
+                self._apply_flash_prog(ev)
+            except Exception as e:  # noqa
+                self._q.put(("log", ("err", f"[进度异常] {type(e).__name__}: {e}\n")))
 
         # 更新下载进度到状态栏
         if progress is not None:
