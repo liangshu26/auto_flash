@@ -283,16 +283,26 @@ class App:
         dl_scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical",
                                      command=self._dl_canvas.yview)
         main_frame = ttk.Frame(self._dl_canvas)
-        main_frame.bind(
-            "<Configure>",
-            lambda e: self._dl_canvas.configure(scrollregion=self._dl_canvas.bbox("all"))
-        )
+        # 防 Configure 反馈环: 画布resize→设窗口宽→帧resize→scrollregion→画布再resize...
+        # 只在宽度/高度真正变化时才动手, 否则会在某些字体/滚动条几何下反复触发, 卡住 UI。
+        self._dl_last_w = -1
+        self._dl_last_size = (-1, -1)
+
+        def _dl_frame_cfg(_e):
+            size = (main_frame.winfo_width(), main_frame.winfo_height())
+            if size != self._dl_last_size:
+                self._dl_last_size = size
+                self._dl_canvas.configure(scrollregion=self._dl_canvas.bbox("all"))
+
+        def _dl_canvas_cfg(e):
+            if e.width != self._dl_last_w:
+                self._dl_last_w = e.width
+                self._dl_canvas.itemconfigure(self._dl_window, width=e.width)
+
+        main_frame.bind("<Configure>", _dl_frame_cfg)
         self._dl_window = self._dl_canvas.create_window((0, 0), window=main_frame, anchor="nw")
         # 让内部表单宽度跟随画布, 否则 fill="x" 的输入框无法横向铺满
-        self._dl_canvas.bind(
-            "<Configure>",
-            lambda e: self._dl_canvas.itemconfigure(self._dl_window, width=e.width)
-        )
+        self._dl_canvas.bind("<Configure>", _dl_canvas_cfg)
         self._dl_canvas.configure(yscrollcommand=dl_scrollbar.set)
         self._dl_canvas.pack(side="left", fill="both", expand=True)
         dl_scrollbar.pack(side="right", fill="y")
