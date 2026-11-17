@@ -39,8 +39,8 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("XP5 刷机工具 v2.0")
-        root.geometry("1024x900")
-        root.minsize(900, 800)
+        root.geometry("1120x1000")
+        root.minsize(960, 820)
         
         # 设置主题样式
         self.style = ttk.Style()
@@ -81,6 +81,7 @@ class App:
             pass
 
         self._build_ui()
+        self.root.after(200, self._init_log_sash)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll()
         self.refresh_devices()
@@ -111,21 +112,25 @@ class App:
                                           command=self.refresh_devices, style='Action.TButton')
         self.btn_refresh_dev.pack(side="right", padx=(8, 0))
 
-        # 中部: 选项卡
-        nb = ttk.Notebook(main_container)
-        nb.pack(fill="both", expand=True, pady=8)
-        
+        # 中部选项卡 + 底部日志: 用可拖拽的垂直分隔窗, 日志默认占 ~40%,
+        # 窗口缩放时日志按 2:1 多分新增空间 (原来两者 expand 均分, 日志被挤小)
+        self._paned = ttk.PanedWindow(main_container, orient="vertical")
+        self._paned.pack(fill="both", expand=True, pady=8)
+
+        nb = ttk.Notebook(self._paned)
+        self._nb = nb
         self.tab_download = ttk.Frame(nb)
         self.tab_flash = ttk.Frame(nb)
         nb.add(self.tab_download, text="  下载刷机包  ")
         nb.add(self.tab_flash, text="  刷机  ")
-        
+
         self._build_download_tab(self.tab_download)
         self._build_flash_tab(self.tab_flash)
 
         # 底部: 日志
-        logf = ttk.LabelFrame(main_container, text="  运行日志  ")
-        logf.pack(fill="both", expand=True, pady=(8, 0))
+        logf = ttk.LabelFrame(self._paned, text="  运行日志  ")
+        self._paned.add(nb, weight=1)
+        self._paned.add(logf, weight=2)
         
         # 状态栏 (先打包, 确保在底部有空间)
         bar = ttk.Frame(logf)
@@ -166,12 +171,68 @@ class App:
                            ("info", "#dcdcaa"), ("warn", "#ce9178")):
             self.log.tag_config(tag, foreground=color)
 
+    def _init_log_sash(self, _tries=0):
+        """设初始分隔位置: 日志占 ~40%。两个选项卡内容均可滚动, 故选项卡只保底
+        一个可用高度 (刷机 tab 的固定控制行), 不再按其完整内容高度撑大。"""
+        try:
+            h = self._paned.winfo_height()
+            if h <= 1:                      # 窗口尚未映射, 稍后重试 (有限次)
+                if _tries < 5:
+                    self.root.after(150, lambda: self._init_log_sash(_tries + 1))
+                return
+            pos = max(int(h * 0.60), 280)      # 日志默认 ~40%, 选项卡保底 280px
+            pos = min(pos, h - 240)            # 日志至少留 240px
+            self._paned.sashpos(0, pos)
+        except tk.TclError:
+            pass
+
     # ---------------- 下载 tab ----------------
     def _build_download_tab(self, parent):
-        # 创建主容器
-        main_frame = ttk.Frame(parent)
-        main_frame.pack(fill="both", expand=True, padx=8, pady=8)
-        
+        # 可滚动容器: 表单较高时不再挤占运行日志, 用画布承载并允许竖向滚动
+        canvas_frame = ttk.Frame(parent)
+        canvas_frame.pack(fill="both", expand=True, padx=8, pady=8)
+        self._dl_canvas = tk.Canvas(canvas_frame, bg="#f0f0f0", highlightthickness=0)
+        dl_scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical",
+                                     command=self._dl_canvas.yview)
+        main_frame = ttk.Frame(self._dl_canvas)
+        main_frame.bind(
+            "<Configure>",
+            lambda e: self._dl_canvas.configure(scrollregion=self._dl_canvas.bbox("all"))
+        )
+        self._dl_window = self._dl_canvas.create_window((0, 0), window=main_frame, anchor="nw")
+        # 让内部表单宽度跟随画布, 否则 fill="x" 的输入框无法横向铺满
+        self._dl_canvas.bind(
+            "<Configure>",
+            lambda e: self._dl_canvas.itemconfigure(self._dl_window, width=e.width)
+        )
+        self._dl_canvas.configure(yscrollcommand=dl_scrollbar.set)
+        self._dl_canvas.pack(side="left", fill="both", expand=True)
+        dl_scrollbar.pack(side="right", fill="y")
+
+        def _dl_wheel(event):
+            d = event.delta
+            if sys.platform != "darwin":
+                d = d // 120 if abs(d) >= 120 else (1 if d > 0 else -1 if d < 0 else 0)
+            d = max(-5, min(5, d))
+            if d:
+                self._dl_canvas.yview_scroll(-d, "units")
+
+        def _dl_wheel_btn(event):
+            self._dl_canvas.yview_scroll(-1 if event.num == 4 else 1, "units")
+
+        def _dl_wheel_enter(_e):
+            self._dl_canvas.bind_all("<MouseWheel>", _dl_wheel)
+            self._dl_canvas.bind_all("<Button-4>", _dl_wheel_btn)
+            self._dl_canvas.bind_all("<Button-5>", _dl_wheel_btn)
+
+        def _dl_wheel_leave(_e):
+            self._dl_canvas.unbind_all("<MouseWheel>")
+            self._dl_canvas.unbind_all("<Button-4>")
+            self._dl_canvas.unbind_all("<Button-5>")
+
+        self._dl_canvas.bind("<Enter>", _dl_wheel_enter)
+        self._dl_canvas.bind("<Leave>", _dl_wheel_leave)
+
         pad = {"padx": 10, "pady": 6}
         
         # 车型和下载目录在同一行
