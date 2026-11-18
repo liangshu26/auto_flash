@@ -952,31 +952,35 @@ class App:
                 return
         
         # 构建 job 列表
-        jobs = []
-        files = []
+        entries = []   # [(job, 显示行)], 最后按 MCU -> 大包 -> 小包 排序
         for key, pkg_type, pkg_path, is_extracted in selected:
             display_name = os.path.basename(pkg_path)
             if is_extracted:
                 display_name += " [已解压]"
-            
+
             if pkg_type == "mcu":
-                jobs.append(("mcu", "mcu", pkg_path, is_extracted))
-                files.append(f"{display_name} -> mcu")
+                entries.append((("mcu", "mcu", pkg_path, is_extracted),
+                                f"{display_name} -> mcu"))
             elif pkg_type == "vlmu_mcu":
-                jobs.append(("vlmu_mcu", "vlmu", pkg_path, is_extracted))
-                files.append(f"{display_name} -> vlmu mcu")
+                entries.append((("vlmu_mcu", "vlmu", pkg_path, is_extracted),
+                                f"{display_name} -> vlmu mcu"))
             elif pkg_type in ("vlmu_big", "vlmu_small"):
                 kind = "big" if "big" in pkg_type else "small"
-                jobs.append((kind, "vlmu", pkg_path, is_extracted))
-                files.append(f"{display_name} -> vlmu ({pkg_type})")
+                entries.append(((kind, "vlmu", pkg_path, is_extracted),
+                                f"{display_name} -> vlmu ({pkg_type})"))
             elif pkg_type in ("xp5_big", "xp5_small"):
                 kind = "big" if "big" in pkg_type else "small"
                 for target in xp5_targets:
-                    jobs.append((kind, target, pkg_path, is_extracted))
-                    files.append(f"{display_name} -> {target} ({pkg_type})")
+                    entries.append(((kind, target, pkg_path, is_extracted),
+                                    f"{display_name} -> {target} ({pkg_type})"))
             else:
                 self._log("err", f"[ERROR] 未知包类型: {pkg_type}\n")
                 continue
+
+        # 刷写顺序: MCU -> 大包 -> 小包 (与 flasher.plan_jobs 一致, 确认弹窗按此顺序显示)
+        entries.sort(key=lambda e: flasher.KIND_ORDER.get(e[0][0], 99))
+        jobs = [e[0] for e in entries]
+        files = [e[1] for e in entries]
         
         # macOS: 大包依赖包内 Linux 版 fastboot, 禁止; 小包/MCU 走系统 adb, 可正常刷
         if sys.platform == "darwin":

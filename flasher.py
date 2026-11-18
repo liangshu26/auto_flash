@@ -65,6 +65,16 @@ DEPLOY_FAIL_MARKERS = (
 
 ALL_ORDER = ("vlmu", "xp5_a", "xp5_b", "mcu")
 
+# 刷写顺序: MCU 先 (含 VLMU MCU) -> 大包 -> 小包。
+# 小包必须在大包之后: 大包重写整个分区 (含 xpilot), 顺序反了小包会被大包冲掉。
+# MCU (Aurix) 独立于 SoC 分区, 先刷不影响后续大包/小包。
+KIND_ORDER = {"mcu": 0, "vlmu_mcu": 0, "big": 1, "small": 2}
+
+
+def sort_jobs(jobs):
+    """按 MCU -> 大包 -> 小包 稳定排序 (同类保持原有相对顺序, 如 vlmu 先于 xp5_a)。"""
+    return sorted(jobs, key=lambda j: KIND_ORDER.get(j[0], 99))
+
 # 大包重试: adc_flashall.sh 里的 auto_fastboot_by_usb_id.sh 只给 60s 等板子进
 # fastboot, 超时就直接 rc=1 退出 (日志表现: 有 "waiting for device to enter
 # fastboot mode" 却始终没有 "board_type:" 那一行)。此时还没有任何分区被写入,
@@ -765,7 +775,7 @@ def plan_jobs(prep_dir, targets, size_pref="auto"):
             big.append(("big", t, os.path.join(prep_dir, b)))
         if size_pref != "big" and s:
             small.append(("small", t, os.path.join(prep_dir, s)))
-    return big + small + mcu
+    return sort_jobs(big + small + mcu)
 
 
 def expand_targets(targets):
@@ -968,7 +978,7 @@ def run_flash(prep_dir, targets, size_pref="auto", dry_run=False,
     if not jobs:
         log(f"[WARN] No packages matched in {prep_dir} for the requested target(s).")
 
-    log("[OK] ==> Flash order: 大包 -> 小包 -> MCU")
+    log("[OK] ==> Flash order: MCU -> 大包 -> 小包")
     log("")
     ok = execute_jobs(jobs, log=log, dry_run=dry_run,
                       force_serial=force_serial, devices=devices)
