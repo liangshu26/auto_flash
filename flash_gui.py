@@ -1069,9 +1069,14 @@ class App:
     # 主线程却阻塞在 askyesno 上 -> 整个 UI "点了没反应"。弹之前临时置顶,
     # 弹完 100ms 后取消置顶, 避免一直挡在其他应用前面。
     def _modal_ask(self, fn, *args, **kwargs):
+        # 不指定 parent 时, macOS 原生 alert 会被排到主窗口后面, 主线程却阻塞在
+        # 弹窗上 -> 看起来像界面卡死。绑定 parent + 夺焦, 让弹窗作为主窗口的模态
+        # 子窗口弹到最前。
+        kwargs.setdefault("parent", self.root)
         try:
             self.root.attributes("-topmost", True)
             self.root.lift()
+            self.root.focus_force()
             self.root.update_idletasks()
         except tk.TclError:
             pass

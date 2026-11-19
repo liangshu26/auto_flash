@@ -277,5 +277,53 @@ class TestGuiProgressSmoke(unittest.TestCase):
         self.assertNotIn("flashprog", kinds)
 
 
+class TestModalAsk(unittest.TestCase):
+    def setUp(self):
+        import tkinter as tk
+        self.tk = tk
+        for m in ("refresh_devices", "_reload_dir_suggestions", "_poll",
+                  "_auto_refresh_tick"):
+            setattr(flash_gui.App, m, lambda self, *a, **k: None)
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.app = flash_gui.App(self.root)
+
+    def tearDown(self):
+        if getattr(self.app, "_log_fh", None):
+            try:
+                self.app._log_fh.close()
+            except (OSError, ValueError):
+                pass
+            self.app._log_fh = None
+        self.root.destroy()
+
+    def test_injects_parent_and_focuses(self):
+        seen = {}
+
+        def fake_fn(*args, **kwargs):
+            seen.update(kwargs)
+            return "ret"
+
+        with mock.patch.object(self.root, "focus_force") as ff, \
+             mock.patch.object(self.root, "lift") as lf:
+            ret = self.app._modal_ask(fake_fn, "标题", "内容")
+        self.assertEqual(ret, "ret")
+        self.assertIs(seen.get("parent"), self.root)
+        ff.assert_called()
+        lf.assert_called()
+
+    def test_explicit_parent_preserved(self):
+        seen = {}
+        other = self.tk.Toplevel(self.root)
+        other.withdraw()
+
+        def fake_fn(*args, **kwargs):
+            seen.update(kwargs)
+
+        self.app._modal_ask(fake_fn, "t", "m", parent=other)
+        self.assertIs(seen.get("parent"), other)
+        other.destroy()
+
+
 if __name__ == "__main__":
     unittest.main()
